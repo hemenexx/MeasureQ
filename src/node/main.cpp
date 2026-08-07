@@ -1,13 +1,13 @@
 // MeasureQ - firmware mericí krabicky (ESP32-C3-SuperMini)
-// HW: ENS160+AHT21 (I2C) spinane pres P-MOSFET load switch (aktivni LOW),
-// XL6007 boost 2x AAA -> 3.3V, ESP-NOW vysilani do hubu.
+// HW: ENS160+AHT21 (I2C) spinane pres PNP tranzistor (BC557) jako high-side
+// spinac 3.3V vetve senzoru (aktivni LOW), XL63070 (TPS63070) buck-boost
+// 2x AAA -> 3.3V, ESP-NOW vysilani do hubu.
 //
 // Napajeci cyklus (kvuli baterii - ESP32 vetsinu casu spi v deep sleep).
 // Deep sleep = reset cipu, RAM (krome RTC_DATA_ATTR) se neuchova, takze po
 // kazdem probuzeni bezi cely setup() znovu od zacatku:
 //   1. zapnout napajeni senzoru
-//   2. pockat SENSOR_WARMUP_MS (ENS160 potrebuje az 3 min na zahrati -
-//      podle datasheetu, viz PROJECT_NOTES.md)
+//   2. pockat SENSOR_WARMUP_MS (viz definice nize a PROJECT_NOTES.md)
 //   3. inicializovat I2C, precist senzor
 //   4. vypnout napajeni senzoru - uz neni potreba, setri baterii pred WiFi
 //   5. inicializovat WiFi/ESP-NOW, odeslat paket, kratce pockat na potvrzeni
@@ -20,7 +20,7 @@
 //  - hubMac[] (MAC adresa hubu - vypsana hubem na Serial po prvnim flashi,
 //    viz src/hub/main.cpp)
 //  - API knihovny ScioSense_ENS16x
-//  - P-MOSFET load switch zapojeni - viz PROJECT_NOTES.md
+//  - PNP tranzistor (BC557) - zapojeni viz PROJECT_NOTES.md
 
 #include <Arduino.h>
 #include <Wire.h>
@@ -59,9 +59,11 @@ constexpr uint32_t SEND_CONFIRM_TIMEOUT_MS = 2000;
 constexpr int PIN_SDA = 4;
 constexpr int PIN_SCL = 3;
 
-// Spina P-MOSFET (aktivni LOW = sepnuto) na 3.3V vetvi senzoru. Zbyva v
-// "bezpecne" pinove skupine (0, 1, 10) spolu s GPIO0/1, ktere zustavaji
-// volne pro budouci ADC mereni napeti baterie. Viz PROJECT_NOTES.md.
+// Rizeni PNP tranzistoru BC557 (aktivni LOW = sepnuto) pres baznovy
+// rezistor R1 - spina 3.3V vetev senzoru (high-side spinac), GND senzoru
+// zustava trvale spolecna s ESP32. Zbyva v "bezpecne" pinove skupine
+// (0, 1, 10) spolu s GPIO0/1, ktere zustavaji volne pro budouci ADC
+// mereni napeti baterie. Viz PROJECT_NOTES.md.
 constexpr int SENSOR_POWER_PIN = 10;
 
 Adafruit_AHTX0 aht;
