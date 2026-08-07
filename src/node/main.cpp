@@ -40,9 +40,14 @@ uint8_t hubMac[6] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00}; // TODO: MAC adresa hu
 // cyklu - viz tabulka vydrze v PROJECT_NOTES.md.
 constexpr uint64_t MEASURE_INTERVAL_US = 15ULL * 60 * 1000000; // 15 minut
 
-// ENS160 potrebuje az 3 min na zahrati po zapnuti napajeni, nez da platne
-// hodnoty (podle datasheetu). AHT21 je prakticky okamzity.
-constexpr uint32_t SENSOR_WARMUP_MS = 3UL * 60 * 1000;
+// ENS160 potrebuje po zapnuti napajeni cas na zahrati, nez da platne
+// hodnoty. Zdroje se rozchazi (SparkFun/DFRobot hookup guide uvadi "3 min",
+// popisek konkretniho koupeneho modulu uvadi "< 1 min warm-up" + "< 1 hod
+// start" pro plne ustaleni automaticke baseline korekce). Zvoleno 1 min
+// podle popisku modulu - NEOVERENO na HW, pokud by prvni hodnoty po
+// probuzeni byly nestabilni/nesmyslne, prodlouzit (viz PROJECT_NOTES.md).
+// AHT21 je prakticky okamzity.
+constexpr uint32_t SENSOR_WARMUP_MS = 1UL * 60 * 1000;
 
 // Jak dlouho cekat na potvrzeni odeslani ESP-NOW pred uspanim.
 constexpr uint32_t SEND_CONFIRM_TIMEOUT_MS = 2000;

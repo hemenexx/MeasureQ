@@ -20,9 +20,11 @@ zobrazuje na displejích.
 - **ENS160 + AHT21** (I2C kombo modul) – CO2/eCO2, TVOC, teplota, vlhkost
 - **P-MOSFET load switch** – spíná napájení senzoru přes GPIO (senzor je
   vypnutý, dokud ESP32 spí – viz níže)
-- **XL6007** – boost převodník, zvyšuje napětí ze 2× AAA baterií na 3.3V
-- **Napájecí vypínač** – mezi baterií a XL6007 (fyzický spínač, bez GPIO)
-- Napájení: 2× AAA baterie (přes XL6007)
+- **XL63070** (modul na bázi TI TPS63070) – automatický buck-boost
+  převodník, drží 3.3V ze 2× AAA i s klesajícím napětím baterií (viz
+  [Napájecí modul XL63070](#napájecí-modul-xl63070-tps63070))
+- **Napájecí vypínač** – mezi baterií a XL63070 (fyzický spínač, bez GPIO)
+- Napájení: 2× AAA baterie (přes XL63070)
 
 ### Centrální jednotka (hub) – 1×
 
@@ -92,14 +94,66 @@ spínané větvi, při vypnutí MOSFETu je celý modul skutečně bez napětí.
 Zapojení fyzicky NEOVĚŘENO – založeno na ENS160 datasheetu, ne na testu s
 konkrétním kusem modulu.
 
+**Další potvrzené specifikace ze zápisku k produktu:** rozhraní I2C i SPI
+(potvrzuje výše), MOX senzor pro až 4 nezávislé plyny (TVOC, eCO2, AQI
+výstupy), integrovaná automatická baseline korekce, provozní rozsah
+-40 až +85°C / 5-95% RH. `VDD1 1.71-1.98V` je interní napájecí větev čipu
+(z interního LDO), ne externí napájecí požadavek – modul se napájí přes
+3V3 pin jako obvykle, tohle nic nemění na zapojení.
+
+## Napájecí modul XL63070 (TPS63070)
+
+Koupený modul je označený `XL63070`, ne `XL6007` – to je důležitý rozdíl,
+byla to prvně chybně zaměněná součástka. `XL63070` moduly jsou postavené na
+čipu **TPS63070** (Texas Instruments), skutečném buck-boost převodníku, ne
+na čistě boost čipu XL6007 (ten by pro 2× AAA nebyl vhodný – potřebuje
+vstup min. ~3.6V, což by čerstvé 2× AAA sotva splnily a s vybíjením by
+brzy přestal fungovat).
+
+Potvrzené specifikace (z popisků prodejce/výrobce modulu, ne z fyzického
+testu):
+
+- Start napětí ~2.8V, po naběhnutí funguje v rozsahu ~2V–9V vstup
+- Výstup volitelný 3.3V/5V/9V (mechanismus volby na konkrétním kusu -
+  pravděpodobně pájecí propojka/jumper - zatím NEOVĚŘENO, potřeba foto
+  fyzického modulu)
+- Max. výstupní proud 2A (víc než dost pro ESP32-C3 + senzor)
+- Nízký ripple (~8mV při 3.3V výstupu)
+
+Buck-boost topologie (na rozdíl od prostého boost) znamená, že modul umí
+držet 3.3V i kdyby vstup z baterií byl chvíli nad i pod touto hodnotou -
+pro 2× AAA (nominál ~3V, postupně klesá) je to vhodnější volba.
+
+**Zapojení (obecný princip, přesné pájecí body NEOVĚŘENY):**
+
+| Pin modulu | Připojit na |
+|---|---|
+| VIN+ | + z baterií (přes napájecí vypínač) |
+| VIN- / GND | - z baterií |
+| VOUT+ | 3.3V napájecí větev (ESP32-C3, MOSFET source, senzor) |
+| VOUT- / GND | společná GND |
+
+Output je potřeba nastavit/potvrdit na 3.3V (u víceúčelových modulů typicky
+pájecí propojka nebo DIP switch) - upřesnit až podle fotky konkrétního kusu.
+
 ## Napájecí režim node (deep sleep + spínání senzoru)
 
-ENS160 má provozní proud **~29mA** a po zapnutí potřebuje **až 3 minuty
-zahřívání**, než dá platné hodnoty (potvrzeno více zdroji, viz
-[ENS160 datasheet](https://www.sciosense.com/wp-content/uploads/2023/12/ENS160-Datasheet.pdf)).
-To výrazně převyšuje spotřebu ESP32-C3 v deep sleep (řádově µA), takže
-klíčové pro výdrž baterie je **hlavně to, jak dlouho běží senzor**, ne
-samotný deep sleep ESP32.
+ENS160 má provozní proud **~29mA**. Doba zahřívání po zapnutí napájení, než
+dá platné hodnoty, se v dostupných zdrojích rozchází:
+
+- SparkFun/DFRobot hookup guide (nezávislé zdroje, odvozené z datasheetu):
+  **~3 minuty**
+- Popisek konkrétního koupeného modulu: **"< 1 minute warm-up"** + navíc
+  samostatně **"< 1 hour start"** (pravděpodobně čas na plné ustálení
+  automatické baseline korekce, ne blokující požadavek před první hodnotou)
+
+Zvoleno **1 minuta** (`SENSOR_WARMUP_MS` v kódu) podle popisku konkrétního
+modulu – NEOVĚŘENO na HW. Pokud by po nasazení první hodnoty po probuzení
+byly nestabilní/nesmyslné, prodloužit zpět směrem ke 3 minutám.
+
+Proud senzoru výrazně převyšuje spotřebu ESP32-C3 v deep sleep (řádově µA),
+takže klíčové pro výdrž baterie je **hlavně to, jak dlouho běží senzor**,
+ne samotný deep sleep ESP32.
 
 Proto: `src/node/main.cpp` zapíná senzor přes P-MOSFET (GPIO10, aktivní
 LOW) jen na dobu zahřátí + čtení, pak ho vypne a teprve potom odešle data
@@ -107,14 +161,17 @@ přes ESP-NOW a jde spát (`esp_deep_sleep_start()` s timer wakeup).
 Poradové číslo paketu (`packetSeq`) je v `RTC_DATA_ATTR` paměti, která na
 rozdíl od běžných globálních proměnných deep sleep přežije.
 
-Odhad výdrže 2× AAA (~1000mAh reálně přes XL6007) podle intervalu probouzení
-(3 min zahřívání ENS160 na každý cyklus):
+Odhad výdrže 2× AAA (~1000mAh reálně přes XL63070) podle intervalu probouzení
+(1 min zahřívání ENS160 na každý cyklus):
 
 | Interval probouzení | Podíl doby zapnutí senzoru | Průměrný proud | Odhad výdrže |
 |---|---|---|---|
-| 15 min | 20 % | ~5.8mA | ~7 dní |
-| 30 min | 10 % | ~2.9mA | ~14 dní |
-| 60 min | 5 % | ~1.5mA | ~1 měsíc |
+| 15 min | ~6.7 % | ~1.9mA | ~3 týdny |
+| 30 min | ~3.3 % | ~1.0mA | ~6 týdnů |
+| 60 min | ~1.7 % | ~0.5mA | ~3 měsíce |
+
+(Pokud by se zahřívání muselo vrátit na 3 minuty, viz předchozí verze
+tabulky v historii commitů – řádově 3× horší výdrž při stejném intervalu.)
 
 Výchozí hodnota v kódu je `MEASURE_INTERVAL_US = 15 minut` – uprav podle
 požadované rovnováhy mezi čerstvostí dat a výdrží baterie.
