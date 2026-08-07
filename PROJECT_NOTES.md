@@ -113,10 +113,14 @@ brzy přestal fungovat).
 Potvrzené specifikace (z popisků prodejce/výrobce modulu, ne z fyzického
 testu):
 
-- Start napětí ~2.8V, po naběhnutí funguje v rozsahu ~2V–9V vstup
-- Výstup volitelný 3.3V/5V/9V (mechanismus volby na konkrétním kusu -
-  pravděpodobně pájecí propojka/jumper - zatím NEOVĚŘENO, potřeba foto
-  fyzického modulu)
+- Vstupní napětí: 2V–16V (2× AAA, i vybité ~1V/článek = 2V, je na spodní
+  hraně rozsahu)
+- Výstupní napětí: 2.5V–9V, konkrétní modul volitelný 3.3V/5V/9V
+  (mechanismus volby na koupeném kusu - pravděpodobně pájecí propojka/jumper
+  - zatím NEOVĚŘENO, potřeba foto fyzického modulu)
+- Pracovní režim PWM/PFM (automatické přepínání) – PFM zvyšuje účinnost
+  při malém odběru, což sedí na to, že modul většinu času napájí jen
+  hluboce spící ESP32 (řádově µA) mezi krátkými špičkami při měření/vysílání
 - Max. výstupní proud 2A (víc než dost pro ESP32-C3 + senzor)
 - Nízký ripple (~8mV při 3.3V výstupu)
 
