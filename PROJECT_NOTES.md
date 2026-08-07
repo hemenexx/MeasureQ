@@ -15,9 +15,13 @@ zobrazuje na displejích.
 
 ### Měřicí krabička (node) – 3×
 
-- **ESP32-C3-SuperMini** – hlavní MCU, WiFi/ESP-NOW vysílání dat do hubu
+- **ESP32-C3-SuperMini** – hlavní MCU, WiFi/ESP-NOW vysílání dat do hubu,
+  většinu času v deep sleep (viz [Napájecí režim node](#napájecí-režim-node-deep-sleep--spínání-senzoru))
 - **ENS160 + AHT21** (I2C kombo modul) – CO2/eCO2, TVOC, teplota, vlhkost
+- **P-MOSFET load switch** – spíná napájení senzoru přes GPIO (senzor je
+  vypnutý, dokud ESP32 spí – viz níže)
 - **XL6007** – boost převodník, zvyšuje napětí ze 2× AAA baterií na 3.3V
+- **Napájecí vypínač** – mezi baterií a XL6007 (fyzický spínač, bez GPIO)
 - Napájení: 2× AAA baterie (přes XL6007)
 
 ### Centrální jednotka (hub) – 1×
@@ -33,12 +37,94 @@ zobrazuje na displejích.
   napájecí větvi (bez GPIO), viz TODO níže
 - Napájení: USB-C přímo do ESP32
 
-## Piny (node, ESP32-C3-SuperMini) – NEOVĚŘENO na HW
+## Piny (node, ESP32-C3-SuperMini) – zapojení fyzicky NEOVĚŘENO (kontinuitou/multimetrem)
 
-| Signál | Pin |
-|---|---|
-| I2C SDA | 8 |
-| I2C SCL | 9 |
+| Signál | Pin | Poznámka |
+|---|---|---|
+| I2C SDA | GPIO4 | mimo strapping piny (2/8/9) a JTAG (5/6/7) |
+| I2C SCL | GPIO3 | mimo strapping piny (2/8/9) a JTAG (5/6/7) |
+| Napájení senzoru (MOSFET gate) | GPIO10 | aktivní LOW = senzor zapnutý; GPIO0/1 záměrně ponechány volné pro budoucí ADC měření napětí baterie |
+
+GPIO8 a GPIO9 se pro I2C záměrně nepoužívají – jsou to strapping piny
+(ovlivňují bootovací mód) a navíc GPIO8 je sdílené se zabudovanou LED a
+GPIO9 s tlačítkem BOOT. Zdroj: [Last Minute Engineers – ESP32-C3 Super
+Mini Pinout Reference](https://lastminuteengineers.com/esp32-c3-super-mini-pinout-reference/).
+
+**Pull-up rezistory na I2C:** SDA i SCL potřebují pull-up proti 3.3V (I2C
+je open-drain sběrnice). ENS160+AHT21 kombo moduly (klony DFRobot Gravity
+SEN0515) je mívají zapájené přímo na desce – nutno zkontrolovat na
+konkrétním kusu (vizuálně, nebo multimetrem odpor SDA↔3.3V a SCL↔3.3V).
+Pokud tam nejsou, přidat externě 2× 4.7kΩ – **na spínanou (MOSFETem)
+větev 3.3V senzoru, ne na trvale živou 3.3V ESP32** (viz
+[Napájecí režim node](#napájecí-režim-node-deep-sleep--spínání-senzoru)) –
+jinak by senzor mohl být částečně zpětně napájený přes I2C linky i s
+vypnutým MOSFETem. Interní pull-up ESP32-C3 (~45kΩ) je na spolehlivý provoz
+moc slabý, nespoléhat na něj samotný. Stačí jedna sada pro celou sběrnici
+(ne per-čip, i když ENS160 a AHT21 jsou dva čipy na jednom modulu).
+
+### Zapojení konkrétního senzorového modulu
+
+Koupený modul má 8 pinů: `VIN, 3V3, GND, SCL, SDA, ADD, CS, INT` (na desce
+samotné, dle fotky, značené i s alternativní SPI funkcí:
+`SCL/SCLK, SDA/MOSI, ADD/MISO, CS, INT`) – potvrzuje, že jde o ENS160
+s volitelným I2C/SPI rozhraním (+ AHT21 na stejné I2C sběrnici, bez
+vlastních konfiguračních pinů, pevná adresa). Pojmenování pinů na desce
+vizuálně odpovídá ENS160 datasheetu (2026-08-07, foto modulu).
+
+| Pin senzoru | Připojit na | Proč |
+|---|---|---|
+| 3V3 | **spínaná** 3.3V (výstup MOSFETu) | napájení – VIN jde přes palubní LDO, který potřebuje >3.3V na vstupu (typicky ~4.3V+), takže se z 3.3V zdroje nepoužívá |
+| VIN | nezapojeno | viz výše |
+| GND | GND | – |
+| SCL | GPIO3 (ESP32-C3) | I2C clock |
+| SDA | GPIO4 (ESP32-C3) | I2C data |
+| ADD | **spínaná** 3.3V (stejný net jako 3V3) | HIGH → I2C adresa ENS160 `0x53` (LOW by dalo `0x52`) – podle [ENS160 datasheetu](https://www.sciosense.com/wp-content/uploads/2023/12/ENS160-Datasheet.pdf); nutno sedět s adresou použitou v `ScioSense_ENS16x` knihovně v kódu |
+| CS | **spínaná** 3.3V (stejný net jako 3V3) | HIGH = I2C režim (LOW by přepnul čip do SPI) – nenechávat volně viset |
+| INT | nezapojeno | firmware zatím jen polluje senzor, přerušení nevyužívá |
+
+**Proč ADD/CS na spínanou větev, ne na trvale živou 3.3V:** pokud by ADD/CS
+(nebo pull-upy) zůstaly na 3.3V, která běží i když je senzor "vypnutý" MOSFETem,
+mohl by senzor being částečně napájený zpětně přes ochranné diody těchto
+pinů – MOSFET by tak reálně nešetřil tolik energie, kolik by se čekalo.
+Když všechny piny senzoru (VCC, ADD, CS, případné pull-upy) visí na stejné
+spínané větvi, při vypnutí MOSFETu je celý modul skutečně bez napětí.
+
+Zapojení fyzicky NEOVĚŘENO – založeno na ENS160 datasheetu, ne na testu s
+konkrétním kusem modulu.
+
+## Napájecí režim node (deep sleep + spínání senzoru)
+
+ENS160 má provozní proud **~29mA** a po zapnutí potřebuje **až 3 minuty
+zahřívání**, než dá platné hodnoty (potvrzeno více zdroji, viz
+[ENS160 datasheet](https://www.sciosense.com/wp-content/uploads/2023/12/ENS160-Datasheet.pdf)).
+To výrazně převyšuje spotřebu ESP32-C3 v deep sleep (řádově µA), takže
+klíčové pro výdrž baterie je **hlavně to, jak dlouho běží senzor**, ne
+samotný deep sleep ESP32.
+
+Proto: `src/node/main.cpp` zapíná senzor přes P-MOSFET (GPIO10, aktivní
+LOW) jen na dobu zahřátí + čtení, pak ho vypne a teprve potom odešle data
+přes ESP-NOW a jde spát (`esp_deep_sleep_start()` s timer wakeup).
+Poradové číslo paketu (`packetSeq`) je v `RTC_DATA_ATTR` paměti, která na
+rozdíl od běžných globálních proměnných deep sleep přežije.
+
+Odhad výdrže 2× AAA (~1000mAh reálně přes XL6007) podle intervalu probouzení
+(3 min zahřívání ENS160 na každý cyklus):
+
+| Interval probouzení | Podíl doby zapnutí senzoru | Průměrný proud | Odhad výdrže |
+|---|---|---|---|
+| 15 min | 20 % | ~5.8mA | ~7 dní |
+| 30 min | 10 % | ~2.9mA | ~14 dní |
+| 60 min | 5 % | ~1.5mA | ~1 měsíc |
+
+Výchozí hodnota v kódu je `MEASURE_INTERVAL_US = 15 minut` – uprav podle
+požadované rovnováhy mezi čerstvostí dat a výdrží baterie.
+
+**MOSFET zapojení (návrh, NEOVĚŘENO na HW):** P-kanálový logic-level MOSFET
+(např. AO3401A, SOT-23) – Source na trvale živou 3.3V (výstup XL6007), Drain
+na spínanou 3.3V větev senzoru, Gate na GPIO10 (ESP32 3.3V logika dá dostatečné
+Vgs na sepnutí) + pull-up rezistor ~10kΩ z Gate na trvale živou 3.3V (zajistí
+výchozí vypnutý stav, dokud firmware GPIO explicitně nenastaví). Volitelně
+sériový rezistor ~100-220Ω mezi GPIO a Gate.
 
 ## Piny (hub, ESP32 30pin) – NEOVĚŘENO na HW
 
@@ -101,8 +187,19 @@ zatím nepoužitý (`false`) – orientace montáže není ověřená.
 - **Napájecí tlačítko na hubu** – zatím firmware s ním vůbec nepočítá
   (předpoklad: čistě fyzický spínač v napájecí větvi). Pokud má jít o
   "soft power" řízené firmwarem, je potřeba přidat GPIO a logiku.
-- **Deep sleep na node** – zatím `delay()` mezi měřeními, baterie (2× AAA)
-  by z toho těžila přechodem na `esp_deep_sleep`.
+- **P-MOSFET load switch pro senzor** – konkrétní součástka (navrženo
+  AO3401A) a hodnoty rezistorů jsou jen odhad, needs ověřit na HW. Pokud
+  bude ADD/CS/pull-upy nakonec zapojeno na trvale živou 3.3V místo spínané
+  větve, přepočítat dopad na výdrž baterie (viz
+  [Napájecí režim node](#napájecí-režim-node-deep-sleep--spínání-senzoru)).
+- **Interval probouzení node** (`MEASURE_INTERVAL_US`, výchozí 15 min) a
+  doba zahřívání senzoru (`SENSOR_WARMUP_MS`, výchozí 3 min) – zatím
+  odhad z datasheetu, doladit podle reálné výdrže/potřeby čerstvosti dat.
+- **IDLE režim ENS160** – čip má kromě STANDARD i IDLE/DEEP_SLEEP režimy s
+  nižší spotřebou, možná rychlejším náběhem než studený start – zatím
+  nevyužito (firmware čip vždy úplně vypíná/zapíná přes MOSFET). Přesné
+  proudy pro IDLE se nepodařilo dohledat z veřejných zdrojů, chtělo by to
+  změřit na reálném HW.
 - **Desetinná místa na displeji** – `TM1637Display` nemá API pro desetinnou
   tečku, teplota/vlhkost se tak momentálně zobrazují jako celé číslo ×10
   (např. `236` = 23.6 °C) bez vizuálního oddělovače. Řešit až podle
