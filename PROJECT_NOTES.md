@@ -39,13 +39,20 @@ zobrazuje na displejích.
   napájecí větvi (bez GPIO), viz TODO níže
 - Napájení: USB-C přímo do ESP32
 
-## Piny (node, ESP32-C3-SuperMini) – zapojení fyzicky NEOVĚŘENO (kontinuitou/multimetrem)
+## Piny (node, ESP32-C3-SuperMini)
 
 | Signál | Pin | Poznámka |
 |---|---|---|
-| I2C SDA | GPIO4 | mimo strapping piny (2/8/9) a JTAG (5/6/7) |
-| I2C SCL | GPIO3 | mimo strapping piny (2/8/9) a JTAG (5/6/7) |
+| I2C SDA | GPIO4 | **POTVRZENO kontinuitou multimetrem (2026-08-08)** – původní předpoklad byl správně; viz [Zjištění z prvního testu na reálném HW](#zjištění-z-prvního-testu-na-reálném-hw-2026-08-08) o zmatku kolem měření |
+| I2C SCL | GPIO3 | POTVRZENO kontinuitou multimetrem (2026-08-08) |
 | Napájení senzoru (báze PNP tranzistoru BC557, přes R1) | GPIO10 | aktivní LOW = senzor zapnutý; GPIO0/1 záměrně ponechány volné pro budoucí ADC měření napětí baterie |
+
+**Pozor – GPIO4 je defaultně JTAG pin (MTMS) na ESP32-C3** (dřívější
+poznámka v tomhle souboru mylně uváděla JTAG piny jako 5/6/7, správně je to
+4/5/6/7). V běžném Arduino/PlatformIO programu bez aktivně zapnutého JTAG
+debuggeru by to nemělo vadit (piny fungují jako normální GPIO), ale
+zůstává to otevřená otázka, pokud by I2C na GPIO3/4 dál nefungovalo i po
+vyloučení ostatních příčin – zvážit přesun na jiný pin (např. GPIO0/1).
 
 GPIO8 a GPIO9 se pro I2C záměrně nepoužívají – jsou to strapping piny
 (ovlivňují bootovací mód) a navíc GPIO8 je sdílené se zabudovanou LED a
@@ -83,8 +90,8 @@ vizuálně odpovídá ENS160 datasheetu (2026-08-07, foto modulu).
 | 3V3 | **spínaná** 3.3V (Kolektor Q1) | napájení – VIN jde přes palubní LDO, který potřebuje >3.3V na vstupu (typicky ~4.3V+), takže se z 3.3V zdroje nepoužívá |
 | VIN | nezapojeno | viz výše |
 | GND | trvale živá GND (společná s ESP32) | u high-side spínače (Q1 = PNP) se GND nikdy nepřerušuje - viz [Napájecí režim node](#napájecí-režim-node-deep-sleep--spínání-senzoru) |
-| SCL | GPIO3 (ESP32-C3) | I2C clock |
-| SDA | GPIO4 (ESP32-C3) | I2C data |
+| SCL | GPIO3 (ESP32-C3) | I2C clock – POTVRZENO kontinuitou (2026-08-08) |
+| SDA | GPIO4 (ESP32-C3) | I2C data – POTVRZENO kontinuitou (2026-08-08) |
 | ADD | **spínaná** 3.3V (stejný net jako 3V3) | HIGH → I2C adresa ENS160 `0x53` (LOW by dalo `0x52`) – podle [ENS160 datasheetu](https://www.sciosense.com/wp-content/uploads/2023/12/ENS160-Datasheet.pdf); nutno sedět s adresou použitou v `ScioSense_ENS16x` knihovně v kódu |
 | CS | **spínaná** 3.3V (stejný net jako 3V3) | HIGH = I2C režim (LOW by přepnul čip do SPI) – nenechávat volně viset |
 | INT | nezapojeno | firmware zatím jen polluje senzor, přerušení nevyužívá |
@@ -100,6 +107,82 @@ toho se "ztrácí" jen pár desetin voltu na straně napájení senzoru
 
 Zapojení fyzicky NEOVĚŘENO – založeno na ENS160 datasheetu, ne na testu s
 konkrétním kusem modulu.
+
+### Zjištění z prvního testu na reálném HW (2026-08-08)
+
+Po zapojení první krabičky (senzor + Q1 + pull-upy na breadboardu) a nahrání
+`src/node_test/main.cpp` senzor **stále nekomunikuje po I2C** (potvrzeno LED
+indikátorem – viz níže – i opakovaným `[E][Wire.cpp:513] requestFrom():
+i2cRead returned Error -1` v Serial logu při prvních pokusech). Co už je
+vyloučené jako příčina (ověřeno multimetrem):
+
+- **Piny SDA/SCL** – potvrzeno kontinuitou: SDA=GPIO4, SCL=GPIO3, sedí s
+  kódem. (Cestou k tomuhle závěru došlo k dočasnému omylu – SDA/SCL byly na
+  chvíli v kódu prohozené kvůli chybnému čtení kontinuity, kdy se popletl
+  pin "3.3V" s pinem "3" na desce senzoru. Opraveno zpět.)
+- **Pull-up rezistory R3/R4 (4.7kΩ)** – potvrzeno napěťovým měřením: na
+  SDA i SCL je při zapnutém senzoru stabilních ~3.3V (ne plovoucí/nulové).
+- **GND kontinuita** mezi ESP32 a senzorovým modulem – potvrzeno.
+- **Kontinuita signálních vodičů** (ESP32 GPIO ↔ piny senzoru) – potvrzeno,
+  žádný přerušený spoj na breadboardu.
+- **CS a ADD piny senzoru na 3.3V** – potvrzeno správně podle ENS160
+  datasheetu (CSn HIGH = I2C režim, LOW by přepnul na SPI; ADD HIGH = I2C
+  adresa `0x53`). Není to invertované.
+
+**LED indikátor stavu (`src/node_test/main.cpp`):** vestavěná LED na
+ESP32-C3-SuperMini (GPIO8, aktivní LOW) bliká, když firmware úspěšně
+komunikuje s oběma senzory (AHT21 i ENS160), a trvale svítí, když ne –
+užitečné pro rychlou vizuální kontrolu, obzvlášť dokud nebyl vyřešený
+problém s neviditelným Serial výstupem (viz níže).
+
+**VÝSLEDEK (2026-08-08): I2C funguje, hodnoty potvrzené na reálném HW.**
+S finálním zapojením (SDA=GPIO4, SCL=GPIO3 – stejné jako úplně původní
+předpoklad) LED bliká a Serial Monitor ukazuje stabilní čtení:
+
+```
+Teplota:  32.1 C   Vlhkost:  33.2 %   eCO2:   400 ppm   TVOC:    24 ppb
+```
+
+(eCO2 ~400ppm = normální atmosférická baseline, TVOC nízké = čistý vzduch,
+vlhkost ~33% běžná pokojová hodnota; teplota 32°C o něco vyšší než pokojová
+– pravděpodobně mírné samo-zahřívání v uzavřené krabičce od MOX ohřívače
+ENS160, netestováno mimo krabičku).
+
+**Skutečná příčina původního `Error -1` zůstává nejistá** (zapojení bylo
+mezitím vícekrát fyzicky sondováno multimetrem, takže je možné, že šlo o
+nespolehlivý kontakt na breadboardu, který se "opravil" sám). Zato se
+podařilo najít a opravit **samostatný, nezávislý problém**, který
+znemožňoval cokoliv vidět na Serial Monitoru (viz
+[Chybějící Serial výstup](#chybějící-serial-výstup---arduino_usb_cdc_on_boot-2026-08-08)
+níže) – i po vyřešení I2C komunikace (LED blikala) nešlo dlouho ověřit
+skutečné hodnoty, protože `Serial.print()` fyzicky nikam neodcházelo.
+
+### Chybějící Serial výstup - ARDUINO_USB_CDC_ON_BOOT (2026-08-08)
+
+I když LED indikátor potvrzoval, že firmware běží a I2C komunikuje, po
+dlouhou dobu se nedařilo na Serial Monitoru (ani mém automatizovaném, ani
+tom spuštěném přímo uživatelem ve VS Code terminálu) zobrazit vůbec nic
+kromě ROM bootloader hlášky.
+
+**Příčina:** ESP32-C3-SuperMini nemá externí USB-UART čip (CP2102/CH340) –
+má jen vestavěný nativní USB-Serial/JTAG řadič. ROM bootloader hlášky vždy
+jdou přes tenhle řadič (proto byly vždy vidět), ale bez explicitních build
+flagů Arduino framework defaultně mapuje `Serial` na klasickou UART0
+periferii (fyzické piny GPIO20/21), které na tomhle konkrétním boardu
+nikam nevedou. `Serial.print()` volání tedy v kódu proběhla v pořádku
+(proto LED blikala normálně), ale data fyzicky nikdy nedorazila k USB.
+
+**Oprava:** přidán `build_flags` do `[node_common]` v `platformio.ini`:
+
+```ini
+build_flags =
+    -DARDUINO_USB_MODE=1
+    -DARDUINO_USB_CDC_ON_BOOT=1
+```
+
+Tím se `Serial` přesměruje na stejný vestavěný USB-Serial/JTAG řadič, který
+už beztak firmware používá pro ROM hlášky a flashování. Platí pro `env:node`
+i `env:node-test` (obě běží na stejné desce).
 
 **Další potvrzené specifikace ze zápisku k produktu:** rozhraní I2C i SPI
 (potvrzuje výše), MOX senzor pro až 4 nezávislé plyny (TVOC, eCO2, AQI
@@ -296,11 +379,24 @@ zatím nepoužitý (`false`) – orientace montáže není ověřená.
 - **Board definice** – `esp32-c3-devkitm-1` a `esp32doit-devkit-v1` v
   `platformio.ini` jsou nejbližší generické desky, ne nutně přesná shoda s
   koupenými klony. Ověřit po prvním flashi.
-- **Piny** (node I2C, hub displeje/tlačítka) – čistě předpoklad, viz tabulky
-  výše. Upravit podle skutečného zapojení.
-- **Knihovna ENS160** (`sciosense/ScioSense_ENS16x`) – API
-  (`begin()`, `setOperationMode()`, `getECO2()`, `getTVOC()`) ověřeno jen
-  z dokumentace/webu, ne z reálné kompilace proti nainstalované verzi.
+- **Piny node I2C** – POTVRZENO kontinuitou (SDA=GPIO4, SCL=GPIO3), viz
+  [Zjištění z prvního testu na reálném HW](#zjištění-z-prvního-testu-na-reálném-hw-2026-08-08).
+  **Piny hub** (displeje/tlačítka) – stále čistě předpoklad, hub zatím
+  fyzicky nezapojen.
+- **Knihovna ENS160** (`sciosense/ScioSense_ENS16x` v2.0.5) – API
+  OVĚŘENO reálnou kompilací + inspekcí zdrojů nainstalované knihovny
+  (2026-08-08): třída se jmenuje `ENS160`, ne `ScioSense_ENS16x`;
+  `begin(&Wire, adresa)`, `init()`, `startStandardMeasure()`; čtení až po
+  `wait()`+`update()==RESULT_OK`+`hasNewData()`, pak `getEco2()`/`getTvoc()`
+  (malá písmena). Použito v `src/node_test/main.cpp` i `src/node/main.cpp`.
+- **I2C senzor VYŘEŠENO (2026-08-08)** – potvrzeno reálnými hodnotami ze
+  Serial Monitoru (teplota/vlhkost/eCO2/TVOC, viz
+  [Zjištění z prvního testu na reálném HW](#zjištění-z-prvního-testu-na-reálném-hw-2026-08-08)),
+  ne jen LED indikátorem. Přesná příčina původního `Error -1` selhání
+  zůstává nejistá (pravděpodobně vadný kontakt na breadboardu).
+- **Chybějící Serial výstup VYŘEŠENO (2026-08-08)** – chyběl
+  `ARDUINO_USB_CDC_ON_BOOT` build flag, viz
+  [Chybějící Serial výstup](#chybějící-serial-výstup---arduino_usb_cdc_on_boot-2026-08-08).
 - **Napájecí tlačítko na hubu** – zatím firmware s ním vůbec nepočítá
   (předpoklad: čistě fyzický spínač v napájecí větvi). Pokud má jít o
   "soft power" řízené firmwarem, je potřeba přidat GPIO a logiku.

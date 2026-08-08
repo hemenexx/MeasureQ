@@ -13,13 +13,12 @@
 //   5. inicializovat WiFi/ESP-NOW, odeslat paket, kratce pockat na potvrzeni
 //   6. esp_deep_sleep_start() na MEASURE_INTERVAL_US
 //
-// NEOVERENO NA HW - pred prvnim flashem zkontrolovat/upravit:
-//  - PIN_SDA/PIN_SCL/SENSOR_POWER_PIN nize (vychozi piny konkretniho
-//    ESP32-C3-SuperMini klonu se lisi kus od kusu)
+// PIN_SDA/PIN_SCL a API knihovny ScioSense_ENS16x jsou uz overene na realnem
+// HW (viz src/node_test/main.cpp a PROJECT_NOTES.md). Pred prvnim flashem
+// KONKRETNI krabicky jeste zkontrolovat/upravit:
 //  - NODE_ID (zmenit pro kazdou ze 3 krabicek: 0, 1, 2)
 //  - hubMac[] (MAC adresa hubu - vypsana hubem na Serial po prvnim flashi,
 //    viz src/hub/main.cpp)
-//  - API knihovny ScioSense_ENS16x
 //  - PNP tranzistor (BC557) - zapojeni viz PROJECT_NOTES.md
 
 #include <Arduino.h>
@@ -52,10 +51,15 @@ constexpr uint32_t SENSOR_WARMUP_MS = 1UL * 60 * 1000;
 // Jak dlouho cekat na potvrzeni odeslani ESP-NOW pred uspanim.
 constexpr uint32_t SEND_CONFIRM_TIMEOUT_MS = 2000;
 
-// I2C piny - GPIO4/GPIO3 zvoleny zamerne mimo strapping piny (2, 8, 9) a
-// JTAG piny (5, 6, 7): GPIO8 je navic sdileny se zabudovanou LED a GPIO9
-// s tlacitkem BOOT. Fyzicke zapojeni na desce (silkscreen "4"/"3") zatim
-// NEOVERENO kontinuitou/multimetrem.
+// Jak dlouho (v ramci jednoho setup() behu) cekat na prvni platna data z
+// ENS160, nez to vzdame a posleme paket s nulovymi hodnotami. Na rozdil od
+// src/node_test/main.cpp (ktery cte v nekonecne loop()), tady musime cekat
+// v ramci jednorazoveho behu pred uspanim.
+constexpr uint32_t ENS160_READ_TIMEOUT_MS = 5000;
+
+// I2C piny - GPIO4/GPIO3 zvoleny zamerne mimo strapping piny (2, 8, 9).
+// POTVRZENO kontinuitou multimetrem (2026-08-08): SDA na pinu "4", SCL na
+// pinu "3" - puvodni predpoklad byl spravne (viz PROJECT_NOTES.md).
 constexpr int PIN_SDA = 4;
 constexpr int PIN_SCL = 3;
 
@@ -66,8 +70,12 @@ constexpr int PIN_SCL = 3;
 // mereni napeti baterie. Viz PROJECT_NOTES.md.
 constexpr int SENSOR_POWER_PIN = 10;
 
+// ADD pin senzoru je pripojeny na 3.3V (HIGH) -> I2C adresa ENS160 0x53
+// (LOW by dalo 0x52). Viz PROJECT_NOTES.md.
+constexpr uint8_t ENS160_I2C_ADDRESS = 0x53;
+
 Adafruit_AHTX0 aht;
-ScioSense_ENS16x ens160;
+ENS160 ens160;
 
 // RTC_DATA_ATTR prezije deep sleep (na rozdil od normalnich globalnich
 // promennych) - poradove cislo tak ma smysl i pres spanek.
@@ -113,14 +121,15 @@ void setup()
     Serial.println("AHT21 nenalezen - zkontrolovat zapojeni!");
   }
 
-  bool ensOk = ens160.begin();
+  ens160.begin(&Wire, ENS160_I2C_ADDRESS);
+  bool ensOk = ens160.init();
   if (!ensOk)
   {
     Serial.println("ENS160 nenalezen - zkontrolovat zapojeni!");
   }
   else
   {
-    ens160.setOperationMode(ENS16X_OPMODE_STD);
+    ens160.startStandardMeasure();
   }
 
   MeasurementPacket packet{};
@@ -131,8 +140,35 @@ void setup()
   aht.getEvent(&humidity, &temp);
   packet.temperatureC = temp.temperature;
   packet.humidityPct = humidity.relative_humidity;
-  packet.co2Ppm = ens160.getECO2();
-  packet.tvocPpb = ens160.getTVOC();
+
+  packet.co2Ppm = 0;
+  packet.tvocPpb = 0;
+  if (ensOk)
+  {
+    // Jednorazove cekani na prvni platna data (na rozdil od
+    // src/node_test/main.cpp, ktery cte prubezne v nekonecne loop(), tady
+    // je to jednorazovy beh pred uspanim).
+    uint32_t waitStart = millis();
+    bool gotData = false;
+    while ((millis() - waitStart) < ENS160_READ_TIMEOUT_MS)
+    {
+      ens160.wait();
+      if (ens160.update() == RESULT_OK && ens160.hasNewData())
+      {
+        gotData = true;
+        break;
+      }
+    }
+    if (gotData)
+    {
+      packet.co2Ppm = ens160.getEco2();
+      packet.tvocPpb = ens160.getTvoc();
+    }
+    else
+    {
+      Serial.println("ENS160: nedockal jsem se platnych dat v limitu!");
+    }
+  }
   packet.batteryVoltage = 0.0f; // TODO: zmerit pres ADC (delic napeti)
 
   sensorPowerOff();
