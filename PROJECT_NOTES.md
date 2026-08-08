@@ -235,12 +235,33 @@ potvrzené.
 
 ### Struktura PlatformIO projektu
 
-Jeden `platformio.ini`, dvě environments:
+Jeden `platformio.ini`, tři environments:
 
-- `env:node` – kompiluje `src/common/` + `src/node/` (build_src_filter
-  vylučuje `src/hub/`)
-- `env:hub` – kompiluje `src/common/` + `src/hub/` (build_src_filter
-  vylučuje `src/node/`)
+- `env:node` – produkční firmware node (build_src_filter vylučuje
+  `src/hub/` a `src/node_test/`)
+- `env:node-test` – diagnostický test senzoru pro node (viz níže;
+  vylučuje `src/hub/` a `src/node/`)
+- `env:hub` – firmware hubu (vylučuje `src/node/` a `src/node_test/`)
+
+Všechny kompilují i `src/common/`.
+
+### Diagnostický test senzoru (`src/node_test/main.cpp`)
+
+Samostatný sketch pro ověření zapojení senzoru na krabičce, oddělený od
+produkčního `src/node/main.cpp` (aby se testováním nezasahovalo do
+deep-sleep cyklu). Rozdíly oproti produkčnímu kódu:
+
+- **Nejde spát** – běží v nekonečné smyčce, čte a vypisuje hodnoty každé
+  2s přes Serial, aby šlo sledovat průběh.
+- **Neposílá nic přes ESP-NOW** – izoluje test jen na I2C/senzor.
+- Na startu udělá **I2C scan** (`Wire.beginTransmission`/`endTransmission`
+  na adresách 1–126) a vypíše, co našel – očekává se `0x38` (AHT21, pevná
+  adresa) a `0x53` (ENS160, protože ADD je na 3.3V/HIGH). Pokud scan
+  nenajde nic, je problém v zapojení (SDA/SCL, napájení přes Q1, GND,
+  chybějící R3/R4), ne v knihovnách – řešit v tomhle pořadí.
+
+Spuštění: vybrat environment `node-test` v PlatformIO panelu (VS Code),
+nebo `pio run -e node-test -t upload -t monitor`.
 
 Stejný vzor jako by šlo použít i pro sdílení kódu mezi více firmware cíli
 v jednom repozitáři – zde využito, protože node a hub běží na jiném HW,
