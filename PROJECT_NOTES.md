@@ -184,6 +184,50 @@ Tím se `Serial` přesměruje na stejný vestavěný USB-Serial/JTAG řadič, kt
 už beztak firmware používá pro ROM hlášky a flashování. Platí pro `env:node`
 i `env:node-test` (obě běží na stejné desce).
 
+### Mereni CO2/TVOC vypnuto - self-heating vyšetřování (2026-08-08)
+
+Po prvním porovnání s reálným teploměrem (naměřeno 32.8°C na senzoru vs
+~26°C na stolním teploměru) se ukázalo, že AHT21 na tomhle kombo modulu
+měří výrazně vyšší teplotu, než je skutečnost. Dan primárně potřebuje
+**přesnou teplotu/vlhkost** – eCO2/TVOC (MOX senzor) je až druhotné.
+
+**Hypotéza č.1 (self-heating od MOX ohřívače ENS160, 200-300°C):** logicky
+zdůvodněná a potvrzená jako obecně známý jev u těchhle kombo modulů
+(zdroj: [Zbotic - ENS160+AHT21 combo](https://zbotic.in/ens160-aht21-combo-air-quality-and-climate-in-one-board/)).
+Modul má dokonce vyfrézovanou izolační drážku v PCB kolem jednoho z čipů
+(pravděpodobně kolem ENS160), což naznačuje, že si toho byl vědom i
+výrobce.
+
+**Test:** vypnuto volání `ens160.startStandardMeasure()` (jediné, co
+spouští MOX ohřívač – bez něj čip zůstává v IDLE, potvrzeno jako
+"low-power" stav v knihovně). ENS160 se stále detekuje (`init()`), jen
+nikdy nezačne aktivně měřit.
+
+**Výsledek testu: teplota se prakticky NEZMĚNILA** (32.5-32.6°C i s
+vypnutým ohřívačem) – hypotéza č.1 tedy **buď neplatí, nebo není jediná
+příčina**. Pravděpodobnější vysvětlení: nashromážděné teplo z dlouhé
+testovací session (desítky minut téměř nepřetržitého napájení přes mnoho
+re-flashů), kdy okolí senzoru nemělo čas vychladnout zpátky na pokojovou
+teplotu mezi jednotlivými testy. **Probíhá test:** odpojit USB, nechat
+vychladnout ~5-10 min, pak zkontrolovat úplně první čtení po startu –
+výsledek zatím NEZAZNAMENÁN, čeká se na dokončení.
+
+**Rozhodnutí (nezávisle na výsledku self-heating testu):** měření
+CO2/TVOC (`ens160.startStandardMeasure()`) zůstává **záměrně vypnuté** v
+`src/node/main.cpp` i `src/node_test/main.cpp` – `packet.co2Ppm`/`tvocPpb`
+se posílají jako `0`. Duvod: Dan prioritizuje přesnou teplotu/vlhkost;
+pokud by se ukázalo, že ohřívač skutečně přispívá k self-heatingu (i když
+test naznačuje, že možná ne jako hlavní příčina), aktivní měření plynů by
+tomu jen škodilo. Snadno se znovu zapne odkomentováním
+`startStandardMeasure()` volání, pokud by CO2/TVOC data byla v budoucnu
+zase potřeba.
+
+Vedlejší efekt vypnutí: `SENSOR_WARMUP_MS` (1 min) byl původně odvozený
+od doby zahřívání ENS160 MOX ohřívače – bez aktivního měření je teoreticky
+zbytečně dlouhý (AHT21 je téměř okamžitý), coz by mohlo výrazně zlepšit
+výdrž baterie. **Hodnota zatím NEZKRÁCENA** – vyžaduje přepočítat tabulku
+výdrže baterie výše a promyslet zvlášť.
+
 **Další potvrzené specifikace ze zápisku k produktu:** rozhraní I2C i SPI
 (potvrzuje výše), MOX senzor pro až 4 nezávislé plyny (TVOC, eCO2, AQI
 výstupy), integrovaná automatická baseline korekce, provozní rozsah
@@ -397,6 +441,17 @@ zatím nepoužitý (`false`) – orientace montáže není ověřená.
 - **Chybějící Serial výstup VYŘEŠENO (2026-08-08)** – chyběl
   `ARDUINO_USB_CDC_ON_BOOT` build flag, viz
   [Chybějící Serial výstup](#chybějící-serial-výstup---arduino_usb_cdc_on_boot-2026-08-08).
+- **AHT21 self-heating – NEDOŘEŠENO, čeká se na test po vychladnutí** –
+  viz [Mereni CO2/TVOC vypnuto](#mereni-co2tvoc-vypnuto---self-heating-vyšetřování-2026-08-08).
+  Vypnutí ENS160 ohřívače teplotu nezlepšilo, takže příčina je
+  pravděpodobně nashromážděné teplo z dlouhé testovací session, ne (jen)
+  MOX ohřívač. Čeká se na výsledek testu po ~5-10 min vychladnutí.
+- **CO2/TVOC měření záměrně vypnuté** – `ens160.startStandardMeasure()`
+  se nevolá (viz stejná sekce výše). Pokud/až bude potřeba, jde snadno
+  zase zapnout.
+- **`SENSOR_WARMUP_MS` (1 min) ke zvážení zkrácení** – od vypnutí
+  CO2/TVOC měření je teoreticky zbytečně dlouhý (AHT21 je okamžitý).
+  Nezkráceno zatím – vyžaduje přepočet tabulky výdrže baterie.
 - **Napájecí tlačítko na hubu** – zatím firmware s ním vůbec nepočítá
   (předpoklad: čistě fyzický spínač v napájecí větvi). Pokud má jít o
   "soft power" řízené firmwarem, je potřeba přidat GPIO a logiku.

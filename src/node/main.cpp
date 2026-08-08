@@ -39,23 +39,16 @@ uint8_t hubMac[6] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00}; // TODO: MAC adresa hu
 // cyklu - viz tabulka vydrze v PROJECT_NOTES.md.
 constexpr uint64_t MEASURE_INTERVAL_US = 15ULL * 60 * 1000000; // 15 minut
 
-// ENS160 potrebuje po zapnuti napajeni cas na zahrati, nez da platne
-// hodnoty. Zdroje se rozchazi (SparkFun/DFRobot hookup guide uvadi "3 min",
-// popisek konkretniho koupeneho modulu uvadi "< 1 min warm-up" + "< 1 hod
-// start" pro plne ustaleni automaticke baseline korekce). Zvoleno 1 min
-// podle popisku modulu - NEOVERENO na HW, pokud by prvni hodnoty po
-// probuzeni byly nestabilni/nesmyslne, prodlouzit (viz PROJECT_NOTES.md).
-// AHT21 je prakticky okamzity.
+// Puvodne odvozeno z doby zahrati ENS160 MOX ohrivace (~1-3 min, zdroje se
+// rozchazeji). Od te doby se ale ENS160 mereni zamerne VYPNULO (viz
+// startStandardMeasure() nize) kvuli ovlivnovani AHT21 teploty - AHT21 sam
+// o sobe je prakticky okamzity. Tato hodnota je tedy teoreticky zbytecne
+// dlouha (jen brzdi baterii) - NEZKRACENO zatim, protoze by to zmenilo
+// tabulku vydrze baterie v PROJECT_NOTES.md a chce to promyslet zvlast.
 constexpr uint32_t SENSOR_WARMUP_MS = 1UL * 60 * 1000;
 
 // Jak dlouho cekat na potvrzeni odeslani ESP-NOW pred uspanim.
 constexpr uint32_t SEND_CONFIRM_TIMEOUT_MS = 2000;
-
-// Jak dlouho (v ramci jednoho setup() behu) cekat na prvni platna data z
-// ENS160, nez to vzdame a posleme paket s nulovymi hodnotami. Na rozdil od
-// src/node_test/main.cpp (ktery cte v nekonecne loop()), tady musime cekat
-// v ramci jednorazoveho behu pred uspanim.
-constexpr uint32_t ENS160_READ_TIMEOUT_MS = 5000;
 
 // I2C piny - GPIO4/GPIO3 zvoleny zamerne mimo strapping piny (2, 8, 9).
 // POTVRZENO kontinuitou multimetrem (2026-08-08): SDA na pinu "4", SCL na
@@ -127,10 +120,11 @@ void setup()
   {
     Serial.println("ENS160 nenalezen - zkontrolovat zapojeni!");
   }
-  else
-  {
-    ens160.startStandardMeasure();
-  }
+  // ZAMERNE nevolame ens160.startStandardMeasure() - to by spustilo MOX
+  // ohrivac (200-300 C), ktery i pres izolacni drazku v PCB dost ovlivni
+  // sousedici AHT21 (namereno +6-7 C posun teploty, viz PROJECT_NOTES.md).
+  // Dan prioritizuje presnou teplotu/vlhkost pred CO2/TVOC - viz TODO
+  // "Mereni CO2/TVOC vypnuto" v PROJECT_NOTES.md pro moznost znovuzapnuti.
 
   MeasurementPacket packet{};
   packet.nodeId = NODE_ID;
@@ -141,34 +135,8 @@ void setup()
   packet.temperatureC = temp.temperature;
   packet.humidityPct = humidity.relative_humidity;
 
-  packet.co2Ppm = 0;
+  packet.co2Ppm = 0; // ENS160 mereni zamerne vypnuto, viz vyse
   packet.tvocPpb = 0;
-  if (ensOk)
-  {
-    // Jednorazove cekani na prvni platna data (na rozdil od
-    // src/node_test/main.cpp, ktery cte prubezne v nekonecne loop(), tady
-    // je to jednorazovy beh pred uspanim).
-    uint32_t waitStart = millis();
-    bool gotData = false;
-    while ((millis() - waitStart) < ENS160_READ_TIMEOUT_MS)
-    {
-      ens160.wait();
-      if (ens160.update() == RESULT_OK && ens160.hasNewData())
-      {
-        gotData = true;
-        break;
-      }
-    }
-    if (gotData)
-    {
-      packet.co2Ppm = ens160.getEco2();
-      packet.tvocPpb = ens160.getTvoc();
-    }
-    else
-    {
-      Serial.println("ENS160: nedockal jsem se platnych dat v limitu!");
-    }
-  }
   packet.batteryVoltage = 0.0f; // TODO: zmerit pres ADC (delic napeti)
 
   sensorPowerOff();

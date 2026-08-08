@@ -132,10 +132,12 @@ void setup()
     ens160.begin(&Wire, ENS160_I2C_ADDRESS);
     ensOk = ens160.init();
     Serial.println(ensOk ? "ENS160: OK (nalezen)" : "ENS160: CHYBA - odpovida na adrese, ale init() selhal!");
-    if (ensOk)
-    {
-      ens160.startStandardMeasure();
-    }
+    // ZAMERNE nevolame ens160.startStandardMeasure() - to by spustilo MOX
+    // ohrivac (200-300 C), ktery i pres izolacni drazku v PCB dost ovlivni
+    // sousedici AHT21 (namereno +6-7 C posun teploty, viz PROJECT_NOTES.md).
+    // Kdyz zustane cip v IDLE (stav po init()), ohrivac NEbezi - CO2/TVOC
+    // nedostaneme, ale AHT21 zmeri cistou teplotu/vlhkost bez zahrivani od
+    // souseda.
   }
   else
   {
@@ -146,11 +148,12 @@ void setup()
   Serial.println();
 }
 
-// Bliká, kdyz oba senzory uspesne komunikuji; trvale sviti jinak (problem).
-// Dava se zkontrolovat i bez Serial Monitoru - jen podle LED na desce.
+// Bliká, kdyz je AHT21 dostupny (ENS160 se zamerne NEZAPOJUJE do teto
+// podminky - bez startStandardMeasure() zustava v IDLE, coz je ocekavany
+// stav, ne chyba). Trvale sviti, kdyz AHT21 nekomunikuje.
 void blinkStatus()
 {
-  if (ahtOk && ensOk)
+  if (ahtOk)
   {
     digitalWrite(LED_PIN, LOW); // rozsvitit (aktivni LOW)
     delay(150);
@@ -171,29 +174,13 @@ void loop()
   {
     sensors_event_t humidity, temp;
     aht.getEvent(&humidity, &temp);
-    Serial.printf("Teplota: %5.1f C   Vlhkost: %5.1f %%   ",
+    Serial.printf("Teplota: %5.1f C   Vlhkost: %5.1f %%\n",
                    temp.temperature, humidity.relative_humidity);
   }
   else
   {
-    Serial.print("AHT21 nedostupny.   ");
+    Serial.println("AHT21 nedostupny.");
   }
 
-  if (ensOk)
-  {
-    ens160.wait(); // ceka na dalsi mereni (STANDARD rezim ~1s) - udava tempo smycky
-    if (ens160.update() == RESULT_OK && ens160.hasNewData())
-    {
-      Serial.printf("eCO2: %5u ppm   TVOC: %5u ppb\n", ens160.getEco2(), ens160.getTvoc());
-    }
-    else
-    {
-      Serial.println("(cekam na nova data z ENS160)");
-    }
-  }
-  else
-  {
-    Serial.println("ENS160 nedostupny.");
-    delay(READ_INTERVAL_MS);
-  }
+  delay(READ_INTERVAL_MS);
 }
