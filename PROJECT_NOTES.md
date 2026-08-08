@@ -203,14 +203,27 @@ spouští MOX ohřívač – bez něj čip zůstává v IDLE, potvrzeno jako
 "low-power" stav v knihovně). ENS160 se stále detekuje (`init()`), jen
 nikdy nezačne aktivně měřit.
 
-**Výsledek testu: teplota se prakticky NEZMĚNILA** (32.5-32.6°C i s
-vypnutým ohřívačem) – hypotéza č.1 tedy **buď neplatí, nebo není jediná
-příčina**. Pravděpodobnější vysvětlení: nashromážděné teplo z dlouhé
-testovací session (desítky minut téměř nepřetržitého napájení přes mnoho
-re-flashů), kdy okolí senzoru nemělo čas vychladnout zpátky na pokojovou
-teplotu mezi jednotlivými testy. **Probíhá test:** odpojit USB, nechat
-vychladnout ~5-10 min, pak zkontrolovat úplně první čtení po startu –
-výsledek zatím NEZAZNAMENÁN, čeká se na dokončení.
+**Výsledek prvního testu (senzor bežící dlouho v kuse): teplota se
+prakticky NEZMĚNILA** (32.5-32.6°C i s vypnutým ohřívačem) – hypotéza č.1
+tedy **buď neplatí, nebo není jediná příčina**.
+
+**Výsledek testu po vychladnutí (2026-08-08, odpojeno ~5-10 min, pak
+znovu zapojeno):** hned po startu 28.4°C, po ustálení (~5 min běhu)
+**stabilně 28.7-28.9°C** (vs ~26°C na stolním teploměru, tedy offset
+**~2.5-2.9°C**) – vlhkost kolísala 37.7-41.5%, coz vypadá jako realne
+kolisani vzduchu v mistnosti, ne vada senzoru. **Klíčové zjištění: teplota
+se ustálila na stabilní hodnotě, NEROSTLA donekonečna** jako při dlouhém
+nepřetržitém běhu. To potvrzuje, že drtivá většina toho původního 6-7°C
+posunu byla nashromážděné teplo z dlouhé testovací session (mnoho
+re-flashů za sebou bez skutečného vychladnutí), ne vlastnost samotného
+modulu. Zbylý ~2.5-2.9°C offset i s vypnutým ENS160 ohřívačem je
+pravděpodobně od **ESP32-C3 samotného** (CPU, napěťový regulátor) nebo
+obecně provozu desky, ne od ENS160.
+
+**Rozhodnutí:** i 2.5-2.9°C je pro Danovy účely moc (chce znát skutečnou
+teplotu, ne "nějak zvýšenou o neznámou hodnotu") – jde se směrem
+**samostatného senzoru AHT21/AHT20/AHT21B** (viz níže), umístěného na
+kabelu mimo desku ESP32-C3/breadboard, ne nalepeného přímo na ni.
 
 **Rozhodnutí (nezávisle na výsledku self-heating testu):** měření
 CO2/TVOC (`ens160.startStandardMeasure()`) zůstává **záměrně vypnuté** v
@@ -441,11 +454,14 @@ zatím nepoužitý (`false`) – orientace montáže není ověřená.
 - **Chybějící Serial výstup VYŘEŠENO (2026-08-08)** – chyběl
   `ARDUINO_USB_CDC_ON_BOOT` build flag, viz
   [Chybějící Serial výstup](#chybějící-serial-výstup---arduino_usb_cdc_on_boot-2026-08-08).
-- **AHT21 self-heating – NEDOŘEŠENO, čeká se na test po vychladnutí** –
-  viz [Mereni CO2/TVOC vypnuto](#mereni-co2tvoc-vypnuto---self-heating-vyšetřování-2026-08-08).
-  Vypnutí ENS160 ohřívače teplotu nezlepšilo, takže příčina je
-  pravděpodobně nashromážděné teplo z dlouhé testovací session, ne (jen)
-  MOX ohřívač. Čeká se na výsledek testu po ~5-10 min vychladnutí.
+- **AHT21 self-heating – ROZDIAGNOSTIKOVÁNO (2026-08-08)** – po
+  vychladnutí stabilní offset ~2.5-2.9°C (ne rostoucí), pravděpodobně od
+  ESP32-C3/desky, ne od ENS160. Pro Dana pořád moc – **rozhodnuto pořídit
+  samostatný senzor AHT21/AHT20/AHT21B** mimo desku ESP32-C3. Viz
+  [Mereni CO2/TVOC vypnuto](#mereni-co2tvoc-vypnuto---self-heating-vyšetřování-2026-08-08).
+  **Dalsi krok:** az dorazi novy senzor, upravit zapojeni/kod aby cetl z
+  neho misto z kombo modulu (kombo modul zustane nepouzity, nebo se
+  pouzije pozdeji jen pro CO2/TVOC, pokud se mereni znovu zapne).
 - **CO2/TVOC měření záměrně vypnuté** – `ens160.startStandardMeasure()`
   se nevolá (viz stejná sekce výše). Pokud/až bude potřeba, jde snadno
   zase zapnout.
