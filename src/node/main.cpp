@@ -50,6 +50,23 @@ constexpr uint32_t SENSOR_WARMUP_MS = 1UL * 60 * 1000;
 // Jak dlouho cekat na potvrzeni odeslani ESP-NOW pred uspanim.
 constexpr uint32_t SEND_CONFIRM_TIMEOUT_MS = 2000;
 
+// PROVIZORNI kalibracni offset teploty, dokud nedorazi samostatny AHT21/
+// AHT20 senzor mimo desku ESP32-C3 (viz PROJECT_NOTES.md). Pricina zbyvajiciho
+// posunu i s vypnutym ENS160 ohrivacem: ENS160 je porad napajeny/pripojeny
+// po I2C (klidovy proud), a je fyzicky na stejne malicke desticce jako
+// AHT21 - nejde oddelit bez samostatneho modulu. Zmereno 2026-08-08:
+// syrova hodnota 28.9 C vs 26.4 C na stolnim teplomeru -> offset -2.5 C.
+// Pri vymene za samostatny AHT21/AHT20 senzor tento offset SMAZAT/prepocitat.
+constexpr float TEMP_CALIBRATION_OFFSET_C = -2.5f;
+
+// PROVIZORNI kalibracni offset vlhkosti, stejny duvod jako u teploty. POZOR:
+// vlhkost je fyzikalne svazana s teplotou (relativni vlhkost = mnozstvi
+// vodni pary vuci tomu, kolik by vzduch pojmul PRI DANE teplote) - tenhle
+// pevny offset je tedy jen hruby odhad platny poblíž aktualnich podminek,
+// ne presna psychrometricka korekce. Zmereno 2026-08-08: syrova hodnota
+// 39.4 % vs 44 % na referencnim vlhkomeru -> offset +4.6 %.
+constexpr float HUMIDITY_CALIBRATION_OFFSET_PCT = 4.6f;
+
 // I2C piny - GPIO4/GPIO3 zvoleny zamerne mimo strapping piny (2, 8, 9).
 // POTVRZENO kontinuitou multimetrem (2026-08-08): SDA na pinu "4", SCL na
 // pinu "3" - puvodni predpoklad byl spravne (viz PROJECT_NOTES.md).
@@ -133,7 +150,7 @@ void setup()
   sensors_event_t humidity, temp;
   aht.getEvent(&humidity, &temp);
   packet.temperatureC = temp.temperature;
-  packet.humidityPct = humidity.relative_humidity;
+  packet.humidityPct = humidity.relative_humidity + HUMIDITY_CALIBRATION_OFFSET_PCT;
 
   packet.co2Ppm = 0; // ENS160 mereni zamerne vypnuto, viz vyse
   packet.tvocPpb = 0;

@@ -224,6 +224,29 @@ obecně provozu desky, ne od ENS160.
 teplotu, ne "nějak zvýšenou o neznámou hodnotu") – jde se směrem
 **samostatného senzoru AHT21/AHT20/AHT21B** (viz níže), umístěného na
 kabelu mimo desku ESP32-C3/breadboard, ne nalepeného přímo na ni.
+Dodatečné zjištění po odsunutí modulu dál od desky (stále v jednom celku
+s ENS160): offset se nezměnil – ENS160 a AHT21 jsou na stejné malé
+destičce a sdílí napájení přes Q1, takže je nejde softwarově oddělit;
+zbytkové teplo je od ENS160 klidového proudu (I2C aktivní, i bez
+`startStandardMeasure()`), ne od vzdálenosti k ESP32-C3.
+
+**PROVIZORNÍ softwarová kalibrace (2026-08-08),** dokud nedorazí
+samostatný senzor – `TEMP_CALIBRATION_OFFSET_C` a
+`HUMIDITY_CALIBRATION_OFFSET_PCT` v `src/node/main.cpp` i
+`src/node_test/main.cpp`:
+
+| Veličina | Syrová hodnota | Reference | Offset |
+|---|---|---|---|
+| Teplota | 28.9°C | 26.4°C (stolní teploměr) | **-2.5°C** |
+| Vlhkost | 39.4% | 44% (referenční vlhkoměr) | **+4.6%** |
+
+Vlhkostní offset je jen hrubý odhad – relativní vlhkost je fyzikálně
+svázaná s teplotou (teplejší vzduch pojme víc vodní páry při stejném
+% RH), takže pevný aditivní offset je přesný jen poblíž podmínek, za
+kterých byl změřen, ne obecně. Pro účely tohoto projektu (ne laboratorní
+přesnost) to stačí. **Až dorazí samostatný senzor, oba offsety
+přepočítat/smazat** – měly by být blízko nule, protože zdroj zkreslení
+(sdílená deska s ENS160) zmizí.
 
 **Rozhodnutí (nezávisle na výsledku self-heating testu):** měření
 CO2/TVOC (`ens160.startStandardMeasure()`) zůstává **záměrně vypnuté** v

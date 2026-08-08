@@ -47,6 +47,23 @@ constexpr int LED_PIN = 8;
 // (LOW by dalo 0x52). Viz PROJECT_NOTES.md.
 constexpr uint8_t ENS160_I2C_ADDRESS = 0x53;
 
+// PROVIZORNI kalibracni offset teploty, dokud nedorazi samostatny AHT21/
+// AHT20 senzor mimo desku ESP32-C3 (viz PROJECT_NOTES.md). Pricina zbyvajiciho
+// posunu i s vypnutym ENS160 ohrivacem: ENS160 je porad napajeny/pripojeny
+// po I2C (klidovy proud), a je fyzicky na stejne malicke desticce jako
+// AHT21 - nejde oddelit bez samostatneho modulu. Zmereno 2026-08-08:
+// syrova hodnota 28.9 C vs 26.4 C na stolnim teplomeru -> offset -2.5 C.
+// Pri vymene za samostatny AHT21/AHT20 senzor tento offset SMAZAT/prepocitat.
+constexpr float TEMP_CALIBRATION_OFFSET_C = -2.5f;
+
+// PROVIZORNI kalibracni offset vlhkosti, stejny duvod jako u teploty. POZOR:
+// vlhkost je fyzikalne svazana s teplotou (relativni vlhkost = mnozstvi
+// vodni pary vuci tomu, kolik by vzduch pojmul PRI DANE teplote) - tenhle
+// pevny offset je tedy jen hruby odhad platny poblíž aktualnich podminek,
+// ne presna psychrometricka korekce. Zmereno 2026-08-08: syrova hodnota
+// 39.4 % vs 44 % na referencnim vlhkomeru -> offset +4.6 %.
+constexpr float HUMIDITY_CALIBRATION_OFFSET_PCT = 4.6f;
+
 // Kratsi nez v produkcnim kodu - tady nejde o baterii, jen chceme rychle
 // videt, jestli senzor vubec zije. Pro finalni cteni po zahrati pockej
 // dele (viz PROJECT_NOTES.md - SENSOR_WARMUP_MS).
@@ -174,8 +191,10 @@ void loop()
   {
     sensors_event_t humidity, temp;
     aht.getEvent(&humidity, &temp);
-    Serial.printf("Teplota: %5.1f C   Vlhkost: %5.1f %%\n",
-                   temp.temperature, humidity.relative_humidity);
+    float calibratedTemp = temp.temperature + TEMP_CALIBRATION_OFFSET_C;
+    float calibratedHumidity = humidity.relative_humidity + HUMIDITY_CALIBRATION_OFFSET_PCT;
+    Serial.printf("Teplota (syrova): %5.1f C  (kompenzovana: %5.1f C)   Vlhkost (syrova): %5.1f %%  (kompenzovana: %5.1f %%)\n",
+                   temp.temperature, calibratedTemp, humidity.relative_humidity, calibratedHumidity);
   }
   else
   {
