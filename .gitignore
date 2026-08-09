@@ -3,3 +3,6 @@
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
+
+# WiFi heslo a URL Google Apps Scriptu - NIKDY nekomitovat, viz secrets.h.example
+src/hub/secrets.h

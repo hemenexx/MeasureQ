@@ -8,8 +8,15 @@ reálné desce (viz [Otevřené otázky / TODO](#otevřené-otázky--todo)).
 ## Cíl projektu
 
 Bezdrátové měřicí zařízení: 3 samostatné baterkové měřicí krabičky posílají
-data přes ESP-NOW do jedné centrální jednotky, která je v reálném čase
-zobrazuje na displejích.
+data přes ESP-NOW do jedné centrální jednotky (hub), která je přeposílá do
+**Google Sheets** přes WiFi.
+
+**ZMĚNA NÁVRHU (2026-08-08):** původně měl mít hub fyzické displeje
+(3× TM1637) a tlačítka pro zobrazení hodnot přímo na místě. Místo toho se
+teď všechna data zaznamenávají do Google Sheets (přes Google Apps Script
+jako jednoduché HTTP rozhraní) – žádné fyzické zobrazení, sledování přes
+telefon/počítač. Hub tak zůstává jen jako "relay" mezi bateriovými
+krabičkami (ESP-NOW, žádný přístup k internetu) a WiFi/internetem.
 
 ## Hardware – přehled
 
@@ -29,15 +36,15 @@ zobrazuje na displejích.
 ### Centrální jednotka (hub) – 1×
 
 - **ESP32 30pin** (generický DOIT DEVKIT V1 klon) – příjem dat přes
-  ESP-NOW, zobrazování
-- **3× TM1637** 0.36" 4-místný 7-segmentový displej – po jednom pro každou
-  měřicí krabičku, připojeno přímo na GPIO (žádný GPIO expander, na rozdíl
-  od MIDIQ – hub má dost volných pinů)
-- **3× tlačítko** (jedno pod každým displejem) – cykluje zobrazovanou
-  veličinu (teplota/vlhkost/CO2/TVOC) pro daný displej/node
-- **1× napájecí tlačítko** – zatím předpoklad: fyzický spínač přímo v
-  napájecí větvi (bez GPIO), viz TODO níže
-- Napájení: USB-C přímo do ESP32
+  ESP-NOW od node krabiček, přeposlání do Google Sheets přes WiFi (HTTP
+  GET na Google Apps Script web app)
+- Žádné displeje ani tlačítka – čistě "relay" mezi ESP-NOW (bateriové
+  krabičky) a WiFi/internetem
+- Napájení: USB-C přímo do ESP32 (potřebuje být trvale připojený k WiFi)
+
+**WiFi heslo a URL Google Sheets** se nekomitují do gitu – viz
+`src/hub/secrets.h.example` (šablona) a postup nastavení Google Apps
+Scriptu v sekci [Google Sheets logování](#google-sheets-logování) níže.
 
 ## Piny (node, ESP32-C3-SuperMini)
 
@@ -385,26 +392,187 @@ R1/R2 hodnoty samotné jsou stále jen návrh (NEOVĚŘENO na reálném
 zapojení), i když součástka (BC557) a její datasheetové parametry už jsou
 potvrzené.
 
-## Piny (hub, ESP32 30pin) – NEOVĚŘENO na HW
+## Google Sheets logování
 
-| Signál | Pin |
-|---|---|
-| Display 0 (node 0) CLK / DIO | 25 / 26 |
-| Display 1 (node 1) CLK / DIO | 27 / 14 |
-| Display 2 (node 2) CLK / DIO | 12 / 13 |
-| Tlačítko 0 / 1 / 2 | 32 / 33 / 4 |
+Hub (`src/hub/main.cpp`) přeposílá přijatá data z node krabiček do Google
+Sheets přes jednoduché HTTP rozhraní postavené na **Google Apps Script**.
+
+**Postup nastavení (jednorázově, v Google účtu):**
+
+1. Vytvořit nový Google Sheet ([sheets.google.com](https://sheets.google.com))
+2. **Extensions → Apps Script**, vložit tenhle kód (smazat výchozí
+   `function myFunction() {}`):
+
+```javascript
+// Radek 1-3: "aktualni hodnoty" souhrn (B/C/D = M1/M2/M3), vzdy na zacatku
+// listu, prepisuje se pri kazdem prijatem paketu. Radek 5+: historicky log
+// (jeden appendovany radek na kazdy prijaty paket) - kazdy node ma
+// VLASTNI trojici sloupcu Cas/Teplota/Vlhkost (ne jeden sdileny cas), aby
+// M1/M2/M3 slo v grafu porovnat i pres to, ze kazdy posila v jiny okamzik
+// (vlastni nezavisly deep-sleep cyklus). eCO2/TVOC zamerne vynechano
+// (senzor vypnuty, viz PROJECT_NOTES.md "Vypnout mereni CO2/TVOC").
+var NODE_LABELS = ['M1', 'M2', 'M3'];
+var SUMMARY_HEADER_ROW = 1;
+var SUMMARY_TEMP_ROW = 2;
+var SUMMARY_HUM_ROW = 3;
+var LOG_HEADER_ROW = 5;
+
+function doGet(e) {
+  var sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
+
+  if (sheet.getRange(SUMMARY_HEADER_ROW, 1).getValue() === '') {
+    sheet.getRange(SUMMARY_HEADER_ROW, 1).setValue('Aktualni hodnoty:');
+    sheet.getRange(SUMMARY_HEADER_ROW, 2, 1, 3).setValues([NODE_LABELS]);
+    sheet.getRange(SUMMARY_TEMP_ROW, 1).setValue('Teplota (C)');
+    sheet.getRange(SUMMARY_HUM_ROW, 1).setValue('Vlhkost (%)');
+    // Kazdy node ma vlastni trojici sloupcu (Cas/Teplota/Vlhkost) - node
+    // se probouzi/posila nezavisle na ostatnich (vlastni deep-sleep cyklus),
+    // takze spolecny jeden "Cas mereni" sloupec by pro 2 ze 3 nodu v danem
+    // radku neodpovidal realnemu casu jejich mereni.
+    sheet.getRange(LOG_HEADER_ROW, 1, 1, 9).setValues([[
+      'M1 Cas mereni', 'M1 Teplota (C)', 'M1 Vlhkost (%)',
+      'M2 Cas mereni', 'M2 Teplota (C)', 'M2 Vlhkost (%)',
+      'M3 Cas mereni', 'M3 Teplota (C)', 'M3 Vlhkost (%)'
+    ]]);
+    // hodnotove bunky (ne popisky v A) zarovnat doprava - Apps Script by
+    // je jinak zapisoval jako text (leva zarovnani), cisla maji byt
+    // zarovnana jako obvykle cisla, at pod sebou pekne sedi.
+    sheet.getRange(SUMMARY_TEMP_ROW, 2, 1, 3).setHorizontalAlignment('right');
+    sheet.getRange(SUMMARY_HUM_ROW, 2, 1, 3).setHorizontalAlignment('right');
+  }
+
+  var params = e.parameter;
+  var ts = params.ts ? new Date(parseInt(params.ts, 10) * 1000) : new Date();
+  var nodeId = parseInt(params.nodeId, 10);
+  var temp = params.temp !== undefined ? parseFloat(params.temp) : '';
+  var hum = params.hum !== undefined ? parseFloat(params.hum) : '';
+
+  var row = ['', '', '', '', '', '', '', '', ''];
+  if (nodeId >= 0 && nodeId <= 2) {
+    var col = 2 + nodeId; // B=M1, C=M2, D=M3 v souhrnu
+    // POTVRZENO 2026-08-09: bunka casem naformatovana jako Datum (nekdo
+    // do ni drive rucne napsal neco ve tvaru "23.1", Sheets si to
+    // automaticky preformatovalo na datum den.mesic) - setValue() cislo
+    // pak zobrazuje jako datum ("23.1.1900..."). setNumberFormat() to
+    // pri kazdem zapisu vynuti zpet na normalni cislo.
+    sheet.getRange(SUMMARY_TEMP_ROW, col).setValue(temp).setNumberFormat('0.0');
+    sheet.getRange(SUMMARY_HUM_ROW, col).setValue(hum).setNumberFormat('0.0');
+
+    var logCol = nodeId * 3; // 0-indexovano do row[]: M1=0, M2=3, M3=6
+    row[logCol] = ts;
+    row[logCol + 1] = temp;
+    row[logCol + 2] = hum;
+  }
+  sheet.appendRow(row);
+  // appendRow() novy radek cely zarovnat doprava (cas i cisla).
+  var newRow = sheet.getLastRow();
+  sheet.getRange(newRow, 1, 1, 9).setHorizontalAlignment('right');
+  // Stejna ochrana jako u souhrnu - vynutit normalni cislo (ne datum) na
+  // hodnotovych sloupcich noveho radku (cas ve sloupcich A/D/G zustava Date).
+  if (nodeId >= 0 && nodeId <= 2) {
+    var logCol1 = nodeId * 3 + 2; // Teplota (1-indexovano do sloupcu)
+    sheet.getRange(newRow, logCol1, 1, 2).setNumberFormat('0.0');
+  }
+
+  return ContentService.createTextOutput("OK").setMimeType(ContentService.MimeType.TEXT);
+}
+```
+
+(Verze s `ts` parametrem - viz [Fronta a časové razítko](#fronta-a-časové-razítko-2026-08-08) níže pro důvod. `appendRow()` vždy přidá za poslední neprázdný řádek, takže log pod souhrnem funguje bez ručního sledování čísla řádku.)
+
+**POZOR při přechodu ze starého layoutu (2026-08-09):** stará data mají sloupce
+`Cas mereni, Node ID, Teplota, Vlhkost, eCO2, TVOC` v řádcích od 1 - nový
+skript čeká souhrn v řádcích 1-3 a hlavičku logu v řádku 5. Buď staré řádky
+přesunout na jiný list (archiv), nebo smazat, než skript poprvé zapíše
+(jinak by se souhrn zapsal doprostřed starých dat).
+
+3. Uložit, pak **Nasadit (Deploy) → Nové nasazení → Webová aplikace**
+4. **Spustit jako:** Já. **Kdo má přístup:** Kdokoli (DŮLEŽITÉ – jinak ESP32
+   dostane přesměrování na přihlašovací stránku Google místo odpovědi,
+   viz níže)
+5. Autorizovat (kliknout skrz varování "Google neověřil tuto aplikaci" –
+   je to vlastní skript, to je v pořádku)
+6. Zkopírovat URL webové aplikace (`.../exec`)
+
+**POTVRZENO chybou (2026-08-08):** pokud přístup není nastavený na
+"Kdokoli", ESP32 dostane při GET požadavku HTML přihlašovací stránku
+Google místo odpovědi "OK" – vypadá to jako by skript nefungoval, ale ve
+skutečnosti jde jen o špatné nastavení přístupu u nasazení. Oprava: **Nasadit
+→ Spravovat nasazení → tužka (upravit) → změnit "Kdo má přístup" na
+"Kdokoli"**.
+
+**WiFi heslo a URL** se ukládají do `src/hub/secrets.h` (kopie
+`secrets.h.example`, v `.gitignore` – nikdy se nekomituje):
+
+```cpp
+constexpr char WIFI_SSID[] = "...";
+constexpr char WIFI_PASSWORD[] = "...";
+constexpr char SHEETS_WEBHOOK_URL[] = "https://script.google.com/macros/s/XXXXX/exec";
+```
+
+### Problém s WiFi kanálem – POTVRZENO a VYŘEŠENO (2026-08-08)
+
+ESP-NOW vyžaduje stejný WiFi kanál na obou stranách. Hub se po připojení k
+routeru ocitl na jeho kanálu (u Dana potvrzeno kanál 3), zatímco node se k
+žádné síti nepřipojuje a bez zásahu zůstává na kanálu 1 – pakety vůbec
+nedocházely. **Oprava:** node explicitně nastaví kanál přes
+`esp_wifi_set_channel()` (viz `HUB_WIFI_CHANNEL` konstanta v
+`src/node_test/main.cpp` a `src/node/main.cpp`) – hodnotu je nutné ručně
+sladit s tím, co hub po připojení vypíše ("WiFi kanal: X"). Pokud se
+kanál routeru v budoucnu změní (auto-kanál na routeru), je nutné tuhle
+konstantu aktualizovat, nebo routeru nastavit pevný kanál.
+
+### Problém s WiFi power-save – POTVRZENO a VYŘEŠENO (2026-08-08)
+
+I se správně sladěným kanálem pakety pořád nedocházely. Příčina: ESP32
+defaultně zapíná úsporný režim WiFi rádia (modem-sleep/power-save), když
+je STA připojená k reálné AP – rádio pak není vždy plně "vzhůru" a může
+zmeškat ESP-NOW broadcast pakety mimo okna, kdy poslouchá beacony od
+routeru. **Oprava:** `WiFi.setSleep(false);` na hubu hned po úspěšném
+připojení k WiFi (v `connectWiFi()`). Po týhle opravě pakety chodí
+spolehlivě.
+
+### Fronta a časové razítko (2026-08-08)
+
+HTTP požadavek na Google Sheets je blokující a pomalý (1-3+ vteřiny) –
+bez fronty by se pakety přijaté MEZI jednotlivými HTTP voláními ztrácely
+(přepisovaly by "posledni prijaty paket"). Hub teď řadí pakety do kruhové
+fronty (`PENDING_QUEUE_SIZE = 20` v `src/hub/main.cpp`) a zpracovává je
+postupně v `loop()`.
+
+Časové razítko se zaznamenává **hned při přijetí** ESP-NOW paketu (v
+`onDataRecv()`), ne až při odeslání do Sheets – jinak by fronta
+způsobovala rostoucí zpoždění mezi "kdy bylo opravdu změřeno" a "jaký čas
+se zapíše do tabulky". Vyžaduje NTP synchronizaci (`setupTime()`,
+`configTzTime()` s POSIX TZ řetězcem pro Europe/Prague) – bez ní by
+zaznamenaný čas byl jen nesmyslný počet vteřin od 1.1.1970.
+
+### Past: víc nasazení (deployments) se stejným Apps Scriptem
+
+Při úpravě existujícího nasazení je nutné použít **Nasadit → Spravovat
+nasazení → tužka (upravit existující) → Nová verze**, NE "Nové nasazení"
+(to vytvoří úplně nové, jiné URL). Dan omylem vytvořil několik různých
+nasazení téhož skriptu s různými URL, což způsobilo zmatek (upravoval
+kód, ale testovali jsme starou, jinou URL, která se nikdy needitovala).
+Řešení: v "Spravovat nasazení" zkontrolovat, která URL je u AKTUÁLNÍ
+(nejnovější) verze, a tu použít v `secrets.h`. Staré/duplicitní nasazení
+lze archivovat (ikona s šipkou dolů v panelu Konfigurace).
 
 ## Softwarová architektura
 
 ### Struktura PlatformIO projektu
 
-Jeden `platformio.ini`, tři environments:
+Jeden `platformio.ini`, environments:
 
-- `env:node` – produkční firmware node (build_src_filter vylučuje
-  `src/hub/` a `src/node_test/`)
-- `env:node-test` – diagnostický test senzoru pro node (viz níže;
-  vylučuje `src/hub/` a `src/node/`)
-- `env:hub` – firmware hubu (vylučuje `src/node/` a `src/node_test/`)
+- `env:node` – produkční firmware node (deep sleep cyklus)
+- `env:node-test` – diagnostický test senzoru pro node (viz níže; navíc
+  posílá hodnoty přes ESP-NOW broadcast)
+- `env:hub` – produkční firmware hubu (ESP-NOW příjem → Google Sheets)
+- `env:hub-test` – jednoduchý testovací příjem senzorových dat (jen
+  Serial výpis, bez WiFi/Sheets – užitečné pro izolaci ESP-NOW problémů
+  od WiFi/HTTP problémů)
+- `env:wifi-test-node` / `env:wifi-test-hub` – čistý test dosahu ESP-NOW
+  (počítadlo paketů + ztrátovost, bez senzoru)
 
 Všechny kompilují i `src/common/`.
 
@@ -414,9 +582,11 @@ Samostatný sketch pro ověření zapojení senzoru na krabičce, oddělený od
 produkčního `src/node/main.cpp` (aby se testováním nezasahovalo do
 deep-sleep cyklu). Rozdíly oproti produkčnímu kódu:
 
-- **Nejde spát** – běží v nekonečné smyčce, čte a vypisuje hodnoty každé
-  2s přes Serial, aby šlo sledovat průběh.
-- **Neposílá nic přes ESP-NOW** – izoluje test jen na I2C/senzor.
+- **Nejde spát** – běží v nekonečné smyčce, čte a vypisuje hodnoty každých
+  500ms přes Serial, aby šlo sledovat průběh.
+- **Navíc posílá hodnoty přes ESP-NOW na broadcast adresu** (na rozdíl od
+  produkčního `src/node/main.cpp`, který posílá cíleně na MAC hubu) – pro
+  test "senzor + WiFi dohromady" proti `env:hub-test`.
 - Na startu udělá **I2C scan** (`Wire.beginTransmission`/`endTransmission`
   na adresách 1–126) a vypíše, co našel – očekává se `0x38` (AHT21, pevná
   adresa) a `0x53` (ENS160, protože ADD je na 3.3V/HIGH). Pokud scan
@@ -441,19 +611,6 @@ zkopírovat do `hubMac[]` v `src/node/main.cpp` na všech 3 krabičkách.
 Každá krabička má navíc vlastní `NODE_ID` (0/1/2), který se musí ručně
 nastavit před flashem.
 
-### TM1637Display (`src/hub/TM1637Display.*`)
-
-Nízkoúrovňový TM1637 bit-bang protokol a vysokoúrovňové API
-(`showDigits`/`showNumber`/`showAllSegments`/`off`) převzaté z MIDIQ
-projektu (`c:\Users\Dan\Documents\PlatformIO\Projects\MIDIQ\src\TM1637Display.*`).
-Rozdíl: MIDIQ verze jde přes MCP23S17 SPI GPIO expander (kvůli nedostatku
-pinů na MIDIQ desce), MeasureQ hub má dost volných GPIO, takže tahle verze
-píše přímo přes `pinMode`/`digitalWrite`.
-
-`invertedMount` konstruktor parametr (segmentové zrcadlení pro displej
-namontovaný vzhůru nohama, jako u MIDIQ) je zachovaný, ale u MeasureQ
-zatím nepoužitý (`false`) – orientace montáže není ověřená.
-
 ## Otevřené otázky / TODO
 
 - **Board definice** – `esp32-c3-devkitm-1` a `esp32doit-devkit-v1` v
@@ -461,8 +618,6 @@ zatím nepoužitý (`false`) – orientace montáže není ověřená.
   koupenými klony. Ověřit po prvním flashi.
 - **Piny node I2C** – POTVRZENO kontinuitou (SDA=GPIO4, SCL=GPIO3), viz
   [Zjištění z prvního testu na reálném HW](#zjištění-z-prvního-testu-na-reálném-hw-2026-08-08).
-  **Piny hub** (displeje/tlačítka) – stále čistě předpoklad, hub zatím
-  fyzicky nezapojen.
 - **Knihovna ENS160** (`sciosense/ScioSense_ENS16x` v2.0.5) – API
   OVĚŘENO reálnou kompilací + inspekcí zdrojů nainstalované knihovny
   (2026-08-08): třída se jmenuje `ENS160`, ne `ScioSense_ENS16x`;
@@ -491,9 +646,6 @@ zatím nepoužitý (`false`) – orientace montáže není ověřená.
 - **`SENSOR_WARMUP_MS` (1 min) ke zvážení zkrácení** – od vypnutí
   CO2/TVOC měření je teoreticky zbytečně dlouhý (AHT21 je okamžitý).
   Nezkráceno zatím – vyžaduje přepočet tabulky výdrže baterie.
-- **Napájecí tlačítko na hubu** – zatím firmware s ním vůbec nepočítá
-  (předpoklad: čistě fyzický spínač v napájecí větvi). Pokud má jít o
-  "soft power" řízené firmwarem, je potřeba přidat GPIO a logiku.
 - **PNP tranzistorový spínač Q1 (BC557)** – součástka potvrzená (Dan má
   BC547/BC557 po ruce), datasheetové parametry (hFE, Vce(sat)) ověřené.
   Hodnoty R1(1kΩ)/R2(10kΩ) jsou ale pořád jen výpočet na papíře, ne
@@ -513,13 +665,13 @@ zatím nepoužitý (`false`) – orientace montáže není ověřená.
   spínač). Přesné
   proudy pro IDLE se nepodařilo dohledat z veřejných zdrojů, chtělo by to
   změřit na reálném HW.
-- **Desetinná místa na displeji** – `TM1637Display` nemá API pro desetinnou
-  tečku, teplota/vlhkost se tak momentálně zobrazují jako celé číslo ×10
-  (např. `236` = 23.6 °C) bez vizuálního oddělovače. Řešit až podle
-  reálné potřeby čitelnosti.
 - **Napětí baterie** – `batteryVoltage` v paketu se zatím neplní (chybí
   ADC měření na node).
-- **Sdílený CLK pro TM1637** – MIDIQ z důvodu nedostatku pinů sdílí CLK
-  mezi displeji; MeasureQ hub má dost pinů, takže zatím každý displej má
-  vlastní CLK i DIO (6 pinů celkem). Lze zrevidovat, pokud by se GPIO
-  hubu z jiného důvodu nedostávalo.
+- **Hub → Google Sheets VYŘEŠENO a OVĚŘENO na reálném HW (2026-08-08)** –
+  kompletní řetězec node → ESP-NOW → hub → WiFi → Sheets funguje
+  spolehlivě. Cestou bylo nutné vyřešit sladění WiFi kanálu a WiFi
+  power-save (viz [Google Sheets logování](#google-sheets-logování)).
+- **`src/hub/secrets.h`** – WIFI_SSID/WIFI_PASSWORD vyplněné Danem přímo
+  v souboru (nikdy neposílat v konverzaci). SHEETS_WEBHOOK_URL vyplněná a
+  funkční (ověřeno na reálném HW, 2026-08-08) – pozor na past s více
+  nasazeními, viz [Google Sheets logování](#google-sheets-logování).

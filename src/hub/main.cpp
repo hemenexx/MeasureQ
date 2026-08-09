@@ -1,60 +1,67 @@
 // MeasureQ - firmware centralni jednotky (ESP32 30pin)
-// HW: 3x TM1637 (primo na GPIO), 3x tlacitko pod displejem (prepina
-// zobrazovanou velicinu daneho display/node), napajeci tlacitko, USB-C napajeni.
-// Prijima MeasurementPacket pres ESP-NOW od 3 mericich krabicek (viz src/node/).
+// Prijima MeasurementPacket pres ESP-NOW od mericich krabicek (viz
+// src/node/main.cpp) a preposila je do Google Sheets pres HTTP (Google
+// Apps Script web app jako jednoduchy prijimac).
 //
-// NEOVERENO NA HW - pred prvnim flashem zkontrolovat/upravit:
-//  - DISPLAY_CLK_PIN/DISPLAY_DIO_PIN a BUTTON_PIN nize (placeholder piny)
-//  - napajeci tlacitko: predpoklad je, ze jde o fyzicky spinac primo v
-//    napajeci vetvi (neni pripojeny na GPIO) - pokud ma byt "soft power"
-//    rizeny firmwarem, je potreba pridat GPIO a logiku zvlast
+// ZMENA NAVRHU (2026-08-08): puvodni verze mela 3x TM1637 displej +
+// tlacitka pro fyzicke zobrazeni primo na hubu. Misto toho se teď vsechno
+// zaznamenava do Google Sheets - zadne fyzicke zobrazeni, sledovani přes
+// telefon/pocitac. TM1637Display.* jiz nejsou potreba.
 //
-// Po prvnim nahrani vypise Serial vlastni MAC adresu - tu je nutne zkopirovat
-// do hubMac[] v src/node/main.cpp na vsech 3 mericich krabickach.
+// VYZADUJE src/hub/secrets.h (WIFI_SSID, WIFI_PASSWORD,
+// SHEETS_WEBHOOK_URL) - zkopiruj a vypln z secrets.h.example, viz
+// PROJECT_NOTES.md pro navod na Google Apps Script.
+//
+// Po prvnim nahrani vypise Serial vlastni MAC adresu - tu je nutne
+// zkopirovat do hubMac[] v src/node/main.cpp na vsech mericich krabickach.
+//
+// FRONTA + CASOVE RAZITKO (2026-08-08): HTTP pozadavek na Google Sheets je
+// blokujici a pomaly (1-3+ vterin kvuli Google serveru), takze kdyby se
+// ukladal jen "posledni prijaty paket", vsechny pakety prijate MEZI
+// jednotlivymi HTTP volanimi by se ztratily (prepsaly by se). Misto toho
+// se pakety radi do fronty (viz PENDING_QUEUE_SIZE) a odesilaji postupne.
+// Casove razitko se navic zaznamenava HNED PRI PRIJETI (v onDataRecv()),
+// ne az pri odeslani do Sheets - jinak by fronta zpusobovala rostouci
+// zpozdeni mezi "kdy bylo opravdu zmereno" a "jaky cas se zapise do
+// tabulky". Vyzaduje NTP synchronizaci (viz setupTime()) - bez ni by
+// zaznamenany cas byl jen "pocet vterin od 1.1.1970" bez smysluplneho
+// data.
 
 #include <Arduino.h>
 #include <WiFi.h>
 #include <esp_now.h>
+#include <HTTPClient.h>
+#include <time.h>
 
 #include "../common/MeasureQProtocol.h"
-#include "TM1637Display.h"
+#include "secrets.h"
 
-// --- Piny displeju - NEOVERENO na HW ---
-constexpr uint8_t DISPLAY_CLK_PIN[MEASUREQ_NODE_COUNT] = {25, 27, 12};
-constexpr uint8_t DISPLAY_DIO_PIN[MEASUREQ_NODE_COUNT] = {26, 14, 13};
+// Europe/Prague (CET/CEST s automatickym prechodem na letni cas) - POSIX
+// TZ retezec, aby configTzTime() spravne pocital i DST bez rucniho
+// prepinani.
+constexpr char TIMEZONE[] = "CET-1CEST,M3.5.0,M10.5.0/3";
+constexpr char NTP_SERVER[] = "pool.ntp.org";
 
-// --- Piny tlacitek (1 na display, cykluje zobrazovanou velicinu) - NEOVERENO ---
-constexpr uint8_t BUTTON_PIN[MEASUREQ_NODE_COUNT] = {32, 33, 4};
-constexpr uint32_t BUTTON_DEBOUNCE_MS = 200;
-
-enum class DisplayedVariable : uint8_t
+struct QueuedMeasurement
 {
-  Temperature = 0,
-  Humidity = 1,
-  CO2 = 2,
-  TVOC = 3,
-  Count = 4,
+  MeasurementPacket packet;
+  time_t timestamp; // Unix epoch (sekundy) - zachyceno pri prijeti, ne pri odeslani
 };
 
-TM1637Display displays[MEASUREQ_NODE_COUNT] = {
-    TM1637Display(DISPLAY_CLK_PIN[0], DISPLAY_DIO_PIN[0]),
-    TM1637Display(DISPLAY_CLK_PIN[1], DISPLAY_DIO_PIN[1]),
-    TM1637Display(DISPLAY_CLK_PIN[2], DISPLAY_DIO_PIN[2]),
-};
+constexpr size_t PENDING_QUEUE_SIZE = 20;
+QueuedMeasurement pendingQueue[PENDING_QUEUE_SIZE];
+volatile size_t queueHead = 0;  // dalsi volny slot pro zapis (onDataRecv)
+volatile size_t queueTail = 0;  // dalsi polozka ke zpracovani (loop)
+volatile size_t queueCount = 0;
 
-MeasurementPacket latestPacket[MEASUREQ_NODE_COUNT] = {};
-uint32_t lastPacketMs[MEASUREQ_NODE_COUNT] = {0, 0, 0};
-DisplayedVariable shownVariable[MEASUREQ_NODE_COUNT] = {
-    DisplayedVariable::Temperature,
-    DisplayedVariable::Temperature,
-    DisplayedVariable::Temperature,
-};
-uint32_t lastButtonMs[MEASUREQ_NODE_COUNT] = {0, 0, 0};
-
-// Novejsi jadro arduino-esp32 (IDF 5.x) pouziva esp_now_recv_info_t*.
-// Pokud build selze na starsi verzi platformy, nahradit prvni parametr
-// za "const uint8_t *mac".
-void onDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len)
+// ESP-NOW callback bezi na jinem tasku nez loop() - neni bezpecne v nem
+// delat blokujici sitove volani (HTTP pozadavek), proto se paket jen
+// zaradi do fronty a odeslani do Sheets se deje v loop().
+//
+// POTVRZENO kompilaci (2026-08-08): nainstalovana verze jadra pouziva
+// starsi tvar esp_now_recv_cb_t (jen MAC, ne esp_now_recv_info_t*) - ten
+// novejsi tvar s RSSI informaci tahle verze API nema.
+void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
 {
   if (len != sizeof(MeasurementPacket))
   {
@@ -67,16 +74,125 @@ void onDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len)
   {
     return;
   }
-  latestPacket[packet.nodeId] = packet;
-  lastPacketMs[packet.nodeId] = millis();
+
+  if (queueCount >= PENDING_QUEUE_SIZE)
+  {
+    Serial.println("VAROVANI: fronta plna, nejstarsi cekajici paket se zahazuje!");
+    // Uvolnit misto zahozenim nejstarsiho cekajiciho paketu, aby fronta
+    // nezustala trvale ucpana jednim starym zaseknutym zaznamem.
+    queueTail = (queueTail + 1) % PENDING_QUEUE_SIZE;
+    queueCount--;
+  }
+
+  pendingQueue[queueHead].packet = packet;
+  pendingQueue[queueHead].timestamp = time(nullptr); // cas PRIJETI, ne odeslani
+  queueHead = (queueHead + 1) % PENDING_QUEUE_SIZE;
+  queueCount++;
+}
+
+void connectWiFi()
+{
+  Serial.printf("Pripojuji se k WiFi '%s'...\n", WIFI_SSID);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  uint32_t startMs = millis();
+  while (WiFi.status() != WL_CONNECTED && (millis() - startMs) < 15000)
+  {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED)
+  {
+    Serial.printf("Pripojeno. IP: %s   WiFi kanal: %d\n",
+                  WiFi.localIP().toString().c_str(), WiFi.channel());
+
+    // DULEZITE: kdyz je STA pripojena k realne AP, ESP32 defaultne zapina
+    // uspornej rezim radia (modem-sleep/power-save) - to muze zpusobit
+    // zmeskani ESP-NOW broadcast paketu od node, protoze radio nemusi byt
+    // vzdy plne "vzhuru" mimo obdobi, kdy ceka beacony od AP. Vypnuti
+    // uspory drzi radio porad naslouchajici.
+    WiFi.setSleep(false);
+  }
+  else
+  {
+    Serial.println("WiFi pripojeni selhalo - zkontroluj SSID/heslo v secrets.h!");
+  }
+}
+
+// Synchronizuje realny cas pres NTP - bez tohoto by time(nullptr) vracelo
+// jen pocet vterin od bootu (pripadne od 1.1.1970), ne skutecne datum.
+void setupTime()
+{
+  if (WiFi.status() != WL_CONNECTED)
+  {
+    Serial.println("WiFi nepripojeno - NTP synchronizace se preskakuje.");
+    return;
+  }
+
+  Serial.print("Synchronizuji cas pres NTP...");
+  configTzTime(TIMEZONE, NTP_SERVER);
+
+  struct tm timeinfo;
+  uint32_t startMs = millis();
+  while (!getLocalTime(&timeinfo, 1000) && (millis() - startMs) < 15000)
+  {
+    Serial.print(".");
+  }
+  Serial.println();
+
+  if (timeinfo.tm_year > 0)
+  {
+    Serial.printf("Cas synchronizovan: %04d-%02d-%02d %02d:%02d:%02d\n",
+                  timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
+                  timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+  }
+  else
+  {
+    Serial.println("NTP synchronizace selhala - casova razitka nebudou spravna!");
+  }
+}
+
+void sendToSheets(const QueuedMeasurement &item)
+{
+  if (WiFi.status() != WL_CONNECTED)
+  {
+    Serial.println("WiFi nepripojeno - paket se neposila do Sheets.");
+    return;
+  }
+
+  const MeasurementPacket &packet = item.packet;
+  String url = String(SHEETS_WEBHOOK_URL) +
+               "?nodeId=" + String(packet.nodeId) +
+               "&temp=" + String(packet.temperatureC, 1) +
+               "&hum=" + String(packet.humidityPct, 1) +
+               "&co2=" + String(packet.co2Ppm) +
+               "&tvoc=" + String(packet.tvocPpb) +
+               "&ts=" + String((uint32_t)item.timestamp);
+
+  HTTPClient http;
+  http.begin(url);
+  int httpCode = http.GET();
+  http.end();
+
+  Serial.printf("Node %u  #%-6lu  Teplota: %5.1f C   Vlhkost: %5.1f %%  ->  Sheets HTTP %d  (fronta: %u)\n",
+                packet.nodeId, (unsigned long)packet.seq, packet.temperatureC,
+                packet.humidityPct, httpCode, (unsigned)queueCount);
 }
 
 void setup()
 {
   Serial.begin(115200);
+  delay(1500);
 
-  WiFi.mode(WIFI_STA);
-  WiFi.disconnect();
+  Serial.println();
+  Serial.println("=== MeasureQ hub - ESP-NOW -> Google Sheets ===");
+
+  connectWiFi();
+  setupTime();
+
   Serial.print("MAC hubu (zkopirovat do hubMac[] na vsech nodech): ");
   Serial.println(WiFi.macAddress());
 
@@ -86,59 +202,30 @@ void setup()
   }
   esp_now_register_recv_cb(onDataRecv);
 
-  for (uint8_t i = 0; i < MEASUREQ_NODE_COUNT; i++)
-  {
-    displays[i].begin();
-    displays[i].showDigits(TM1637Display::BLANK, TM1637Display::BLANK,
-                            TM1637Display::BLANK, TM1637Display::BLANK);
-    pinMode(BUTTON_PIN[i], INPUT_PULLUP);
-  }
-}
-
-// Vraci hodnotu vybrane veliciny pro dany node, zaokrouhlenou na cele
-// jednotky pro zobrazeni na 4-cislicovem displeji.
-// TODO: teplota/vlhkost se tak zobrazi bez desetinne carky (napr. 236 misto
-// 23.6) - trida TM1637Display zatim nema API pro desetinnou tecku.
-uint16_t valueForDisplay(const MeasurementPacket &packet, DisplayedVariable variable)
-{
-  switch (variable)
-  {
-  case DisplayedVariable::Temperature:
-    return (uint16_t)round(packet.temperatureC * 10.0f);
-  case DisplayedVariable::Humidity:
-    return (uint16_t)round(packet.humidityPct * 10.0f);
-  case DisplayedVariable::CO2:
-    return packet.co2Ppm;
-  case DisplayedVariable::TVOC:
-    return packet.tvocPpb;
-  default:
-    return 0;
-  }
+  Serial.printf("DIAGNOSTIKA: WiFi kanal tesne pred loop(): %d\n", WiFi.channel());
+  Serial.println("Cekam na pakety...");
+  Serial.println();
 }
 
 void loop()
 {
-  uint32_t now = millis();
-
-  for (uint8_t i = 0; i < MEASUREQ_NODE_COUNT; i++)
+  if (queueCount > 0)
   {
-    if (digitalRead(BUTTON_PIN[i]) == LOW && (now - lastButtonMs[i]) > BUTTON_DEBOUNCE_MS)
-    {
-      lastButtonMs[i] = now;
-      uint8_t next = (uint8_t)shownVariable[i] + 1;
-      if (next >= (uint8_t)DisplayedVariable::Count)
-      {
-        next = 0;
-      }
-      shownVariable[i] = (DisplayedVariable)next;
-    }
+    QueuedMeasurement item = pendingQueue[queueTail];
+    queueTail = (queueTail + 1) % PENDING_QUEUE_SIZE;
+    queueCount--;
 
-    bool haveData = lastPacketMs[i] != 0;
-    if (haveData)
-    {
-      displays[i].showNumber(valueForDisplay(latestPacket[i], shownVariable[i]));
-    }
+    sendToSheets(item);
   }
 
-  delay(20);
+  // WiFi muze obcas vypadnout - zkousime znovu pripojit, dokud to nevyjde.
+  static uint32_t lastReconnectAttemptMs = 0;
+  if (WiFi.status() != WL_CONNECTED && (millis() - lastReconnectAttemptMs) > 10000)
+  {
+    lastReconnectAttemptMs = millis();
+    connectWiFi();
+    setupTime();
+  }
+
+  delay(10);
 }

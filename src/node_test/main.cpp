@@ -2,7 +2,10 @@
 // (ESP32-C3-SuperMini). Na rozdil od produkcniho src/node/main.cpp:
 //   - NEJDE spat (zadny deep sleep) - behem cteni zustava zapnuty Serial,
 //     aby se dalo sledovat, co se deje
-//   - NEPOSILA nic pres ESP-NOW - izoluje test jen na I2C/senzor
+//   - VYSILA namerene hodnoty pres ESP-NOW na broadcast adresu (na rozdil
+//     od src/node/main.cpp, ktery posila na konkretni MAC hubu) - proti
+//     tomuhle bezi src/hub_test na prijimaci strane. Diagnosticky nastroj
+//     pro overeni "senzor + WiFi dohromady", ne produkcni chovani.
 //   - na zacatku udela I2C scan (najde adresy pripojenych zarizeni), aby
 //     se dalo overit zapojeni jeste pred tim, nez selze konkretni knihovna
 //
@@ -25,13 +28,20 @@
 
 #include <Arduino.h>
 #include <Wire.h>
+#include <WiFi.h>
+#include <esp_now.h>
+#include <esp_wifi.h>
 #include <Adafruit_AHTX0.h>
 #include <ScioSense_ENS16x.h>
+
+#include "../common/MeasureQProtocol.h"
 
 // POTVRZENO kontinuitou multimetrem (2026-08-08): SDA na pinu "4", SCL na
 // pinu "3" - puvodni predpoklad byl spravne (drivejsi "oprava" na 3/4 byla
 // zalozena na chybnem mereni - zameneny pin "3.3V" za pin "3"). Viz
-// PROJECT_NOTES.md.
+// PROJECT_NOTES.md. Zkusebne prohozeno 2026-08-09 kvuli LED trvale
+// sviti/ahtOk false, LED se nezmenila (porad trvale sviti) - vraceno zpet,
+// prohozene piny tedy nebyly pricinou. Dan overuje zapojeni merakem.
 constexpr int PIN_SDA = 4;
 constexpr int PIN_SCL = 3;
 
@@ -42,6 +52,11 @@ constexpr int SENSOR_POWER_PIN = 10;
 // jako vizualni indikace stavu i bez Serial Monitoru - bliká = oba senzory
 // (AHT21 i ENS160) uspesne komunikuji, trvale zhasnuto = ne.
 constexpr int LED_PIN = 8;
+
+// Dan (2026-08-09): docasne vypnuto kvuli rusivemu blikani, ted zase
+// ZAPNUTO - LED je potreba jako vizualni diagnostika behem ladeni I2C/
+// ESP-NOW, kdyz Serial Monitor neni spolehlivy.
+constexpr bool LED_STATUS_ENABLED = true;
 
 // ADD pin senzoru je pripojeny na 3.3V (HIGH) -> I2C adresa ENS160 0x53
 // (LOW by dalo 0x52). Viz PROJECT_NOTES.md.
@@ -69,16 +84,39 @@ constexpr float HUMIDITY_CALIBRATION_OFFSET_PCT = 4.6f;
 // dele (viz PROJECT_NOTES.md - SENSOR_WARMUP_MS).
 constexpr uint32_t WARMUP_MS = 5000;
 
-constexpr uint32_t READ_INTERVAL_MS = 2000;
+constexpr uint32_t READ_INTERVAL_MS = 5000;
+
+// Vysilame na broadcast (ne na konkretni MAC hubu jako produkcni kod) -
+// jednodussi pro test, neni potreba znat predem MAC prijimace.
+constexpr uint8_t BROADCAST_MAC[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+
+// DULEZITE: ESP-NOW vyzaduje stejny WiFi kanal na obou stranach. Node se
+// (na rozdil od hubu) k zadne WiFi siti nepripojuje, takze bez explicitniho
+// nastaveni zustane na kanalu 1 - jenze hub bezi na kanalu sve realne WiFi
+// site (u Dana potvrzeno kanal 3, 2026-08-08), takze by pakety vubec
+// nedosly. Musi se rucne sladit s tim, co hub po pripojeni vypise
+// ("WiFi kanal: X") - pokud se v budoucnu zmeni kanal routeru, je nutne
+// zmenit i tohle cislo (nebo nastavit routeru pevny kanal).
+constexpr uint8_t HUB_WIFI_CHANNEL = 3;
+constexpr uint8_t TEST_NODE_ID = 0;
 
 Adafruit_AHTX0 aht;
 ENS160 ens160;
+uint32_t packetSeq = 0;
 
 bool ahtOk = false;
 bool ensOk = false;
 
 bool ahtAddrFound = false;
 bool ensAddrFound = false;
+
+// DIAGNOSTIKA (2026-08-08): potvrzuje, jestli se paket aspon uspesne
+// predal WiFi radiu k odeslani (ne jestli ho hub opravdu prijal - to je
+// samostatna otazka, viz PROJECT_NOTES.md).
+void onDataSent(const uint8_t *mac, esp_now_send_status_t status)
+{
+  Serial.printf("  [ESP-NOW odeslano: %s]\n", status == ESP_NOW_SEND_SUCCESS ? "OK" : "CHYBA");
+}
 
 // Vraci pocet nalezenych zarizeni. Krome vypisu si taky poznamena, jestli
 // zivi ocekavane adresy AHT21/ENS160 - diky tomu muzeme nize NEVOLAT
@@ -122,7 +160,10 @@ void setup()
   Serial.println("=== MeasureQ - test senzoru ENS160+AHT21 ===");
 
   pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, LOW); // LED zpocatku sviti (stav pred overenim = "problem")
+  if (LED_STATUS_ENABLED)
+    digitalWrite(LED_PIN, LOW); // LED zpocatku sviti (stav pred overenim = "problem")
+  else
+    digitalWrite(LED_PIN, HIGH); // LED vypnuta - viz LED_STATUS_ENABLED vyse
 
   pinMode(SENSOR_POWER_PIN, OUTPUT);
   digitalWrite(SENSOR_POWER_PIN, LOW); // sepnout Q1 -> zapnout senzor
@@ -161,6 +202,26 @@ void setup()
     Serial.printf("ENS160: CHYBA - adresa 0x%02X na sbernici neodpovida, preskakuji init().\n", ENS160_I2C_ADDRESS);
   }
 
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  esp_wifi_set_channel(HUB_WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
+  if (esp_now_init() != ESP_OK)
+  {
+    Serial.println("ESP-NOW init selhal - hodnoty pujdou jen na Serial, ne pres WiFi!");
+  }
+  else
+  {
+    esp_now_register_send_cb(onDataSent);
+    esp_now_peer_info_t peer{};
+    memcpy(peer.peer_addr, BROADCAST_MAC, 6);
+    peer.channel = HUB_WIFI_CHANNEL;
+    peer.encrypt = false;
+    if (esp_now_add_peer(&peer) != ESP_OK)
+    {
+      Serial.println("esp_now_add_peer (broadcast) selhal!");
+    }
+  }
+
   Serial.println("=== Zacinam prubezne cteni ===");
   Serial.println();
 }
@@ -185,16 +246,38 @@ void blinkStatus()
 
 void loop()
 {
-  blinkStatus();
+  if (LED_STATUS_ENABLED)
+    blinkStatus();
 
   if (ahtOk)
   {
     sensors_event_t humidity, temp;
-    aht.getEvent(&humidity, &temp);
-    float calibratedTemp = temp.temperature + TEMP_CALIBRATION_OFFSET_C;
-    float calibratedHumidity = humidity.relative_humidity + HUMIDITY_CALIBRATION_OFFSET_PCT;
-    Serial.printf("Teplota (syrova): %5.1f C  (kompenzovana: %5.1f C)   Vlhkost (syrova): %5.1f %%  (kompenzovana: %5.1f %%)\n",
-                   temp.temperature, calibratedTemp, humidity.relative_humidity, calibratedHumidity);
+    // DULEZITE: kontrolovat navratovou hodnotu! Kdyz senzor behem behu
+    // odpojis (nebo I2C jinak selze), getEvent() vrati false a temp/
+    // humidity zustanou NEPREPSANE (stara/nahodna hodnota ze stacku) -
+    // bez tehle kontroly bychom klidne poslali "zamrzlou" starou hodnotu
+    // dal, jako by to byla cerstva data.
+    if (aht.getEvent(&humidity, &temp))
+    {
+      float calibratedTemp = temp.temperature + TEMP_CALIBRATION_OFFSET_C;
+      float calibratedHumidity = humidity.relative_humidity + HUMIDITY_CALIBRATION_OFFSET_PCT;
+      Serial.printf("Teplota (syrova): %5.1f C  (kompenzovana: %5.1f C)   Vlhkost (syrova): %5.1f %%  (kompenzovana: %5.1f %%)\n",
+                     temp.temperature, calibratedTemp, humidity.relative_humidity, calibratedHumidity);
+
+      MeasurementPacket packet{};
+      packet.nodeId = TEST_NODE_ID;
+      packet.seq = packetSeq++;
+      packet.temperatureC = calibratedTemp;
+      packet.humidityPct = calibratedHumidity;
+      packet.co2Ppm = 0;
+      packet.tvocPpb = 0;
+      packet.batteryVoltage = 0.0f;
+      esp_now_send(BROADCAST_MAC, reinterpret_cast<uint8_t *>(&packet), sizeof(packet));
+    }
+    else
+    {
+      Serial.println("AHT21: getEvent() selhal - senzor prestal odpovidat (odpojen?). Nic neposilam.");
+    }
   }
   else
   {

@@ -25,30 +25,55 @@
 #include <Wire.h>
 #include <WiFi.h>
 #include <esp_now.h>
+#include <esp_wifi.h>
 #include <esp_sleep.h>
 #include <Adafruit_AHTX0.h>
 #include <ScioSense_ENS16x.h>
 
 #include "../common/MeasureQProtocol.h"
 
-constexpr uint8_t NODE_ID = 0; // ZMENIT per krabicka: 0, 1, 2
-uint8_t hubMac[6] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00}; // TODO: MAC adresa hubu
+constexpr uint8_t NODE_ID = 0; // ZMENIT per krabicka: 0, 1, 2 - tohle je M1 (2026-08-09)
+uint8_t hubMac[6] = {0xB4, 0xBF, 0xE9, 0xC8, 0x57, 0x40}; // MAC hubu, vypsano hubem 2026-08-09
+
+// DULEZITE: ESP-NOW vyzaduje stejny WiFi kanal na obou stranach. Node se
+// (na rozdil od hubu, ktery se pripojuje ke skutecne WiFi kvuli Google
+// Sheets) k zadne WiFi siti nepripojuje, takze bez explicitniho nastaveni
+// zustane na kanalu 1 - jenze hub bezi na kanalu sve realne WiFi site
+// (u Dana potvrzeno kanal 3, 2026-08-08). Musi se rucne sladit s tim, co
+// hub po pripojeni vypise ("WiFi kanal: X") - pokud se v budoucnu zmeni
+// kanal routeru, je nutne zmenit i tohle cislo (nebo nastavit routeru
+// pevny kanal).
+constexpr uint8_t HUB_WIFI_CHANNEL = 3;
 
 // Jak casto se krabicka probouzi a posila data. Delsi interval = vyrazne
 // lepsi vydrz baterie, protoze 3min zahrivani senzoru tvori mensi podil
 // cyklu - viz tabulka vydrze v PROJECT_NOTES.md.
-constexpr uint64_t MEASURE_INTERVAL_US = 15ULL * 60 * 1000000; // 15 minut
+// DOCASNE ZKRACENO na 30s kvuli testovani (2026-08-09) - pri realnem
+// nasazeni na baterii VRATIT ZPET na 15 minut (900), jinak vydrz z tabulky
+// v PROJECT_NOTES.md neplati (SENSOR_WARMUP_MS 1 min pak tvori vetsinu
+// kazdeho cyklu).
+constexpr uint64_t MEASURE_INTERVAL_US = 30ULL * 1000000; // 30 sekund (testovani)
 
 // Puvodne odvozeno z doby zahrati ENS160 MOX ohrivace (~1-3 min, zdroje se
 // rozchazeji). Od te doby se ale ENS160 mereni zamerne VYPNULO (viz
 // startStandardMeasure() nize) kvuli ovlivnovani AHT21 teploty - AHT21 sam
-// o sobe je prakticky okamzity. Tato hodnota je tedy teoreticky zbytecne
-// dlouha (jen brzdi baterii) - NEZKRACENO zatim, protoze by to zmenilo
-// tabulku vydrze baterie v PROJECT_NOTES.md a chce to promyslet zvlast.
-constexpr uint32_t SENSOR_WARMUP_MS = 1UL * 60 * 1000;
+// o sobe je prakticky okamzity. ZKRACENO 2026-08-09 (Dan: "jake zahrivani,
+// ten CO2 senzor je vypnuty") na 100ms - jen zbyva cas na ustaleni napajeni
+// senzoru po sepnuti tranzistoru pred prvnim I2C pristupem. Pri zapnuti
+// ENS160 mereni zpet (viz PROJECT_NOTES.md) je nutne tuhle hodnotu vratit
+// na ~1-3 min kvuli MOX ohrivaci.
+constexpr uint32_t SENSOR_WARMUP_MS = 100;
 
 // Jak dlouho cekat na potvrzeni odeslani ESP-NOW pred uspanim.
 constexpr uint32_t SEND_CONFIRM_TIMEOUT_MS = 2000;
+
+// TESTOVACI REZIM (2026-08-09): senzor se zapne jen jednou pri startu (ne
+// pri kazdem paketu) a dal se bez deep sleep posila kazde TEST_SEND_INTERVAL_MS
+// - pro rychlou zpetnou vazbu pri ladeni na stole. VYPNOUT (false) pred
+// realnym nasazenim na baterii, jinak zadny deep sleep = vybita baterie
+// behem hodin, ne tydnu/mesicu.
+constexpr bool TEST_MODE = false;
+constexpr uint32_t TEST_SEND_INTERVAL_MS = 2000;
 
 // PROVIZORNI kalibracni offset teploty, dokud nedorazi samostatny AHT21/
 // AHT20 senzor mimo desku ESP32-C3 (viz PROJECT_NOTES.md). Pricina zbyvajiciho
@@ -116,16 +141,65 @@ void goToSleep()
   esp_deep_sleep_start();
 }
 
+bool peerReady = false;
+
+void readAndSendPacket()
+{
+  MeasurementPacket packet{};
+  packet.nodeId = NODE_ID;
+  packet.seq = packetSeq++;
+
+  // DIAGNOSTIKA (2026-08-09): Adafruit_AHTX0::getEvent() ma uvnitr
+  // "while (busy) delay(10)" BEZ timeoutu - podezreni, ze kdyz je senzor
+  // pripojeny na delsich dratech (slabsi I2C signal), tahle smycka se
+  // obcas natahne o desitky vterin navic (nepravidelne delsi cykly, viz
+  // PROJECT_NOTES.md). Merime, jak dlouho getEvent() fakt trval.
+  uint32_t ahtStartMs = millis();
+  sensors_event_t humidity, temp;
+  aht.getEvent(&humidity, &temp);
+  Serial.printf("aht.getEvent() trval %lu ms\n", (unsigned long)(millis() - ahtStartMs));
+  packet.temperatureC = temp.temperature;
+  packet.humidityPct = humidity.relative_humidity + HUMIDITY_CALIBRATION_OFFSET_PCT;
+
+  packet.co2Ppm = 0; // ENS160 mereni zamerne vypnuto, viz komentar v setup()
+  packet.tvocPpb = 0;
+  packet.batteryVoltage = 0.0f; // TODO: zmerit pres ADC (delic napeti)
+
+  Serial.printf("Node %u  #%-6lu  Teplota: %5.1f C   Vlhkost: %5.1f %%\n",
+                packet.nodeId, (unsigned long)packet.seq, packet.temperatureC, packet.humidityPct);
+
+  if (!peerReady)
+  {
+    return;
+  }
+
+  sendConfirmed = false;
+  esp_now_send(hubMac, reinterpret_cast<uint8_t *>(&packet), sizeof(packet));
+
+  uint32_t waitStart = millis();
+  while (!sendConfirmed && (millis() - waitStart) < SEND_CONFIRM_TIMEOUT_MS)
+  {
+    delay(10);
+  }
+}
+
 void setup()
 {
   Serial.begin(115200);
+  if (TEST_MODE)
+  {
+    delay(1500); // cas na pripojeni Serial Monitoru po naflashovani
+    Serial.println("=== MeasureQ node - TEST_MODE (bez deep sleep) ===");
+  }
 
   sensorPowerOn();
   delay(SENSOR_WARMUP_MS);
 
   Wire.begin(PIN_SDA, PIN_SCL);
 
+  uint32_t ahtBeginStartMs = millis();
   bool ahtOk = aht.begin();
+  Serial.printf("aht.begin() trval %lu ms\n", (unsigned long)(millis() - ahtBeginStartMs));
   if (!ahtOk)
   {
     Serial.println("AHT21 nenalezen - zkontrolovat zapojeni!");
@@ -143,23 +217,13 @@ void setup()
   // Dan prioritizuje presnou teplotu/vlhkost pred CO2/TVOC - viz TODO
   // "Mereni CO2/TVOC vypnuto" v PROJECT_NOTES.md pro moznost znovuzapnuti.
 
-  MeasurementPacket packet{};
-  packet.nodeId = NODE_ID;
-  packet.seq = packetSeq++;
-
-  sensors_event_t humidity, temp;
-  aht.getEvent(&humidity, &temp);
-  packet.temperatureC = temp.temperature;
-  packet.humidityPct = humidity.relative_humidity + HUMIDITY_CALIBRATION_OFFSET_PCT;
-
-  packet.co2Ppm = 0; // ENS160 mereni zamerne vypnuto, viz vyse
-  packet.tvocPpb = 0;
-  packet.batteryVoltage = 0.0f; // TODO: zmerit pres ADC (delic napeti)
-
-  sensorPowerOff();
+  // V produkcnim rezimu senzor po prvnim cteni v readAndSendPacket() hned
+  // vypneme (setri baterii pred WiFi). V TEST_MODE zustava zapnuty, protoze
+  // se cte opakovane v loop().
 
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
+  esp_wifi_set_channel(HUB_WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
 
   if (esp_now_init() == ESP_OK)
   {
@@ -167,18 +231,12 @@ void setup()
 
     esp_now_peer_info_t peer{};
     memcpy(peer.peer_addr, hubMac, 6);
-    peer.channel = 0;
+    peer.channel = HUB_WIFI_CHANNEL;
     peer.encrypt = false;
 
     if (esp_now_add_peer(&peer) == ESP_OK)
     {
-      esp_now_send(hubMac, reinterpret_cast<uint8_t *>(&packet), sizeof(packet));
-
-      uint32_t waitStart = millis();
-      while (!sendConfirmed && (millis() - waitStart) < SEND_CONFIRM_TIMEOUT_MS)
-      {
-        delay(10);
-      }
+      peerReady = true;
     }
     else
     {
@@ -190,10 +248,28 @@ void setup()
     Serial.println("ESP-NOW init selhal!");
   }
 
+  if (TEST_MODE)
+  {
+    return; // dal pokracuje loop()
+  }
+
+  readAndSendPacket();
+  sensorPowerOff();
   goToSleep();
 }
 
 void loop()
 {
-  // Nedosazitelne - setup() konci esp_deep_sleep_start(), ktery cip resetuje.
+  if (!TEST_MODE)
+  {
+    return; // nedosazitelne - setup() konci esp_deep_sleep_start(), ktery cip resetuje
+  }
+
+  static uint32_t lastSendMs = 0;
+  uint32_t now = millis();
+  if (now - lastSendMs >= TEST_SEND_INTERVAL_MS)
+  {
+    lastSendMs = now;
+    readAndSendPacket();
+  }
 }
